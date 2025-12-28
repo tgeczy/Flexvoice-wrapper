@@ -63,6 +63,47 @@ static inline bool isSpaceLike(char c) {
     return c == ' ' || c == '\t' || c == '\r' || c == '\n';
 }
 
+static void appendNormalizedWide(std::string& out, wchar_t w) {
+    switch (w) {
+    case 0x00A0: // nbsp
+    case 0x200B: // zero-width space
+    case 0x200C:
+    case 0x200D:
+        out.push_back(' ');
+        return;
+    case 0x2018: // left single quote
+    case 0x2019: // right single quote
+        out.push_back('\'');
+        return;
+    case 0x201C: // left double quote
+    case 0x201D: // right double quote
+        out.push_back('"');
+        return;
+    case 0x2013: // en dash
+    case 0x2014: // em dash
+        out.push_back('-');
+        return;
+    case 0x2026: // ellipsis
+        out.append("...");
+        return;
+    default:
+        break;
+    }
+
+    if (w >= 0 && w <= 0xFF) {
+        unsigned char uc = (unsigned char)w;
+        char c = (char)uc;
+        if (uc < 0x20 && c != '\r' && c != '\n' && c != '\t') c = ' ';
+        else if (uc == 0x7F || (uc >= 0x80 && uc <= 0x9F)) c = ' ';
+        else if (uc == 0xA0) c = ' ';
+        out.push_back(c);
+        return;
+    }
+
+    // Anything else: keep things stable by turning it into space.
+    out.push_back(' ');
+}
+
 static const char* digitWord1(char d) {
     switch (d) {
     case '0': return "zero";
@@ -279,6 +320,14 @@ static std::string normalizeFragileTokens(const std::string& in) {
     while (i < in.size()) {
         char c = in[i];
 
+        if (isSpaceLike(c)) {
+            // Collapse all whitespace to a single space. This keeps say-all flowing without per-line pauses
+            // while still giving the engine breathing room between tokens.
+            if (out.empty() || out.back() != ' ') out.push_back(' ');
+            while (i < in.size() && isSpaceLike(in[i])) i++;
+            continue;
+        }
+
         // Apostrophes inside words (contractions / possessives):
         // Without this, "it's" becomes "it" + "ess" (because 's' becomes a single-letter token).
         if (c == '\'') {
@@ -490,21 +539,12 @@ static std::string utf8ToLatin1Safe(const char* sUtf8) {
     ws.resize((size_t)wlen);
     MultiByteToWideChar(CP_UTF8, 0, sUtf8, -1, &ws[0], wlen);
 
-    BOOL usedDefault = FALSE;
-    int alen = WideCharToMultiByte(28591, 0, ws.c_str(), -1, nullptr, 0, "?", &usedDefault);
-    if (alen <= 0) return std::string();
-
     std::string out;
-    out.resize((size_t)alen);
-    WideCharToMultiByte(28591, 0, ws.c_str(), -1, &out[0], alen, "?", &usedDefault);
-
-    if (!out.empty() && out.back() == '\0') out.pop_back();
-
-    for (char& c : out) {
-        unsigned char uc = (unsigned char)c;
-        if (uc < 0x20 && c != '\r' && c != '\n' && c != '\t') c = ' ';
-        else if (uc == 0x7F || (uc >= 0x80 && uc <= 0x9F)) c = ' ';
-        else if (uc == 0xA0) c = ' ';
+    out.reserve((size_t)wlen + 8);
+    for (size_t i = 0; i < ws.size(); i++) {
+        wchar_t w = ws[i];
+        if (w == 0) break;
+        appendNormalizedWide(out, w);
     }
 
     out = normalizeFragileTokens(out);
