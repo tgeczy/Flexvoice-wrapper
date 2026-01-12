@@ -63,6 +63,13 @@ static inline bool isSpaceLike(char c) {
     return c == ' ' || c == '\t' || c == '\r' || c == '\n';
 }
 
+static inline void appendWordWithBoundaries(std::string& out, const char* word, bool spaceAfter) {
+    if (!word || !word[0]) return;
+    if (!out.empty() && !isSpaceLike(out.back())) out.push_back(' ');
+    out += word;
+    if (spaceAfter) out.push_back(' ');
+}
+
 static void appendNormalizedWide(std::string& out, wchar_t w) {
     switch (w) {
     case 0x00A0: // nbsp
@@ -90,14 +97,111 @@ static void appendNormalizedWide(std::string& out, wchar_t w) {
         break;
     }
 
-    if (w >= 0 && w <= 0xFF) {
+    // Keep output in a conservative, engine-safe ASCII-ish set.
+    // (FlexVoice input is fragile; passing through bytes >= 0x80 is a common source of stalls / drops.)
+    if (w >= 0 && w <= 0x7F) {
         unsigned char uc = (unsigned char)w;
         char c = (char)uc;
         if (uc < 0x20 && c != '\r' && c != '\n' && c != '\t') c = ' ';
-        else if (uc == 0x7F || (uc >= 0x80 && uc <= 0x9F)) c = ' ';
-        else if (uc == 0xA0) c = ' ';
+        else if (uc == 0x7F) c = ' ';
         out.push_back(c);
         return;
+    }
+
+    // Latin-1 supplement letters -> ASCII approximations.
+    // This keeps names roughly readable ("Beyoncé" -> "Beyonce") while avoiding non-ASCII bytes.
+    switch (w) {
+    // A/a
+    case 0x00C0: case 0x00C1: case 0x00C2: case 0x00C3: case 0x00C4: case 0x00C5:
+        out.push_back('A');
+        return;
+    case 0x00E0: case 0x00E1: case 0x00E2: case 0x00E3: case 0x00E4: case 0x00E5:
+        out.push_back('a');
+        return;
+    case 0x00C6:
+        out.append("AE");
+        return;
+    case 0x00E6:
+        out.append("ae");
+        return;
+
+    // C/c
+    case 0x00C7:
+        out.push_back('C');
+        return;
+    case 0x00E7:
+        out.push_back('c');
+        return;
+
+    // D/d
+    case 0x00D0:
+        out.push_back('D');
+        return;
+    case 0x00F0:
+        out.push_back('d');
+        return;
+
+    // E/e
+    case 0x00C8: case 0x00C9: case 0x00CA: case 0x00CB:
+        out.push_back('E');
+        return;
+    case 0x00E8: case 0x00E9: case 0x00EA: case 0x00EB:
+        out.push_back('e');
+        return;
+
+    // I/i
+    case 0x00CC: case 0x00CD: case 0x00CE: case 0x00CF:
+        out.push_back('I');
+        return;
+    case 0x00EC: case 0x00ED: case 0x00EE: case 0x00EF:
+        out.push_back('i');
+        return;
+
+    // N/n
+    case 0x00D1:
+        out.push_back('N');
+        return;
+    case 0x00F1:
+        out.push_back('n');
+        return;
+
+    // O/o
+    case 0x00D2: case 0x00D3: case 0x00D4: case 0x00D5: case 0x00D6: case 0x00D8:
+        out.push_back('O');
+        return;
+    case 0x00F2: case 0x00F3: case 0x00F4: case 0x00F5: case 0x00F6: case 0x00F8:
+        out.push_back('o');
+        return;
+
+    // U/u
+    case 0x00D9: case 0x00DA: case 0x00DB: case 0x00DC:
+        out.push_back('U');
+        return;
+    case 0x00F9: case 0x00FA: case 0x00FB: case 0x00FC:
+        out.push_back('u');
+        return;
+
+    // Y/y
+    case 0x00DD:
+        out.push_back('Y');
+        return;
+    case 0x00FD: case 0x00FF:
+        out.push_back('y');
+        return;
+
+    // TH/th and ss
+    case 0x00DE:
+        out.append("TH");
+        return;
+    case 0x00FE:
+        out.append("th");
+        return;
+    case 0x00DF:
+        out.append("ss");
+        return;
+
+    default:
+        break;
     }
 
     // Anything else: keep things stable by turning it into space.
@@ -437,6 +541,31 @@ static std::string normalizeFragileTokens(const std::string& in) {
             continue;
         }
 
+        // Plus handling:
+        // FlexVoice can truncate/stop or drop trailing content when '+' is glued to words
+        // (e.g. "copilot+", "C++"). Treat '+' as a speakable separator.
+        if (c == '+') {
+            char prevCh = (i > 0) ? in[i - 1] : '\0';
+            char nextCh = (i + 1 < in.size()) ? in[i + 1] : '\0';
+
+            const bool prevAlnum = isAsciiAlnum(prevCh);
+            const bool nextAlnum = isAsciiAlnum(nextCh);
+
+            // Also speak repeated pluses, e.g. "C++".
+            const bool prevPlus = (prevCh == '+');
+            const bool nextPlus = (nextCh == '+');
+
+            if (prevAlnum || nextAlnum || prevPlus || nextPlus) {
+                appendWordWithBoundaries(out, "plus", nextAlnum);
+            } else {
+                // If it's floating punctuation, just break tokens.
+                if (out.empty() || !isSpaceLike(out.back())) out.push_back(' ');
+            }
+
+            i++;
+            continue;
+        }
+
         // Digit run -> words
         if (isAsciiDigit(c)) {
             size_t j = i;
@@ -456,16 +585,77 @@ static std::string normalizeFragileTokens(const std::string& in) {
 
         // Alpha token
         if (isAsciiAlpha(c)) {
+            // Dot-separated initialisms like "P.C", "U.S.A.", "e.g.":
+            // FlexVoice can drop the later letters when dots are glued to them.
+            if (i + 2 < in.size() && in[i + 1] == '.' && isAsciiAlpha(in[i + 2])) {
+                size_t k = i;
+                int letterCount = 0;
+                bool sawDot = false;
+                std::string spelled;
+
+                while (k < in.size() && isAsciiAlpha(in[k])) {
+                    const char* nm = letterName(toLowerAscii(in[k]));
+                    if (nm && nm[0]) {
+                        if (!spelled.empty()) spelled.push_back(' ');
+                        spelled += nm;
+                        letterCount++;
+                    }
+
+                    k++;
+
+                    // Require dot + next letter to keep consuming.
+                    if (k < in.size() && in[k] == '.' && (k + 1 < in.size() && isAsciiAlpha(in[k + 1]))) {
+                        sawDot = true;
+                        k++; // skip '.'
+                        continue;
+                    }
+                    break;
+                }
+
+                // Optional trailing dot: "U.S." -> "you ess"
+                if (k < in.size() && in[k] == '.') {
+                    char nextCh = (k + 1 < in.size()) ? in[k + 1] : '\0';
+                    if (!isAsciiAlpha(nextCh)) {
+                        k++;
+                    }
+                }
+
+                if (sawDot && letterCount >= 2 && letterCount <= 10 && !spelled.empty()) {
+                    char nextCh = (k < in.size()) ? in[k] : '\0';
+                    if (!out.empty() && !isSpaceLike(out.back())) out.push_back(' ');
+                    out += spelled;
+                    if (nextCh && (isAsciiAlpha(nextCh) || isAsciiDigit(nextCh))) out.push_back(' ');
+                    i = k;
+                    continue;
+                }
+                // If the pattern looked weird, fall through to the normal alpha path.
+            }
+
             size_t j = i;
-            while (j < in.size() && isAsciiAlpha(in[j])) j++;
+            bool allCaps = true;
+            while (j < in.size() && isAsciiAlpha(in[j])) {
+                char ch = in[j];
+                if (!(ch >= 'A' && ch <= 'Z')) allCaps = false;
+                j++;
+            }
             size_t len = j - i;
 
-            // ALL-CAPS short token -> spell letters
-            bool allCaps = true;
-            for (size_t k = i; k < j; k++) {
-                char ch = in[k];
-                if (!(ch >= 'A' && ch <= 'Z')) { allCaps = false; break; }
+            // URL scheme ("https://"):
+            // The engine often drops "https" or treats it as noise.
+            // Spell it as letters, and speak "://".
+            if (len >= 2 && len <= 10 && (j + 2 < in.size()) && in[j] == ':' && in[j + 1] == '/' && in[j + 2] == '/') {
+                std::string spelled = spellLetters(in.substr(i, len));
+                if (!spelled.empty()) {
+                    if (!out.empty() && !isSpaceLike(out.back())) out.push_back(' ');
+                    out += spelled;
+                    out += " colon slash slash";
+                    out.push_back(' ');
+                    i = j + 3;
+                    continue;
+                }
             }
+
+            // ALL-CAPS short token -> spell letters
             if (allCaps && len >= 2 && len <= 6) {
                 std::string spelled = spellLetters(in.substr(i, len));
                 char nextCh = (j < in.size()) ? in[j] : '\0';
@@ -497,9 +687,48 @@ static std::string normalizeFragileTokens(const std::string& in) {
             continue;
         }
 
-        // Other chars
-        out.push_back(c);
-        i++;
+        // Other chars (punctuation / symbols)
+        {
+            const char prevCh = (i > 0) ? in[i - 1] : '\0';
+            const char nextCh = (i + 1 < in.size()) ? in[i + 1] : '\0';
+
+            // Between token characters, spell common technical separators.
+            if (c == '.' && isAsciiAlnum(prevCh) && isAsciiAlnum(nextCh)) {
+                appendWordWithBoundaries(out, "dot", true);
+                i++;
+                continue;
+            }
+            if (c == '/' && (isAsciiAlnum(prevCh) || isAsciiAlnum(nextCh))) {
+                appendWordWithBoundaries(out, "slash", isAsciiAlnum(nextCh));
+                i++;
+                continue;
+            }
+            if (c == '\\' && (isAsciiAlnum(prevCh) || isAsciiAlnum(nextCh))) {
+                appendWordWithBoundaries(out, "backslash", isAsciiAlnum(nextCh));
+                i++;
+                continue;
+            }
+            if (c == '@' && isAsciiAlnum(nextCh)) {
+                appendWordWithBoundaries(out, "at", true);
+                i++;
+                continue;
+            }
+            if (c == '#' && isAsciiAlnum(nextCh)) {
+                appendWordWithBoundaries(out, "hash", true);
+                i++;
+                continue;
+            }
+            if (c == '_' && (isAsciiAlnum(prevCh) || isAsciiAlnum(nextCh))) {
+                // Treat snake_case as separate words.
+                if (out.empty() || !isSpaceLike(out.back())) out.push_back(' ');
+                i++;
+                continue;
+            }
+
+            // Default: keep the character.
+            out.push_back(c);
+            i++;
+        }
     }
 
     while (!out.empty() && out.back() == ' ') out.pop_back();
