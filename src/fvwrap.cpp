@@ -646,10 +646,10 @@ static std::string normalizeFragileTokens(const std::string& in) {
             if (len >= 2 && len <= 10 && (j + 2 < in.size()) && in[j] == ':' && in[j + 1] == '/' && in[j + 2] == '/') {
                 std::string spelled = spellLetters(in.substr(i, len));
                 if (!spelled.empty()) {
-                    if (!out.empty() && !isSpaceLike(out.back())) out.push_back(' ');
-                    out += spelled;
-                    out += " colon slash slash";
-                    out.push_back(' ');
+                    appendWordWithBoundaries(out, spelled.c_str(), true);
+                    appendWordWithBoundaries(out, "colon", true);
+                    appendWordWithBoundaries(out, "slash", true);
+                    appendWordWithBoundaries(out, "slash", true);
                     i = j + 3;
                     continue;
                 }
@@ -658,11 +658,8 @@ static std::string normalizeFragileTokens(const std::string& in) {
             // ALL-CAPS short token -> spell letters
             if (allCaps && len >= 2 && len <= 6) {
                 std::string spelled = spellLetters(in.substr(i, len));
-                char nextCh = (j < in.size()) ? in[j] : '\0';
                 if (!spelled.empty()) {
-                    if (!out.empty() && !isSpaceLike(out.back())) out.push_back(' ');
-                    out += spelled;
-                    if (nextCh && (isAsciiAlpha(nextCh) || isAsciiDigit(nextCh))) out.push_back(' ');
+                    appendWordWithBoundaries(out, spelled.c_str(), true);
                     i = j;
                     continue;
                 }
