@@ -1,6 +1,11 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 
+#define FVWRAP_NORMALIZER_VERSION "FVWRAP-NORM-V6-NONATO"
+#ifdef _MSC_VER
+#pragma message("Building " FVWRAP_NORMALIZER_VERSION)
+#endif
+
 #pragma warning(disable : 4250)
 
 #include <windows.h>
@@ -225,6 +230,10 @@ static const char* digitWord1(char d) {
 }
 
 // Consonants only (so we don't break article "a" or pronoun "I")
+//
+// NOTE: FlexVoice is sensitive to certain short tokens. In practice, we found
+// that using the canonical 3-letter spellings for S/R/L ("ess", "arr", "ell") is
+// more reliable than shorter forms like "es" / "el".
 static const char* consonantLetterName(char lc) {
     switch (lc) {
     case 'b': return "bee";
@@ -244,7 +253,7 @@ static const char* consonantLetterName(char lc) {
     case 's': return "ess";
     case 't': return "tee";
     case 'v': return "vee";
-    case 'w': return "double u";
+    case 'w': return "double you";
     case 'x': return "ex";
     case 'y': return "why";
     case 'z': return "zee";
@@ -277,7 +286,7 @@ static const char* letterName(char lc) {
     case 't': return "tee";
     case 'u': return "you";
     case 'v': return "vee";
-    case 'w': return "double u";
+    case 'w': return "double you";
     case 'x': return "ex";
     case 'y': return "why";
     case 'z': return "zee";
@@ -295,6 +304,27 @@ static std::string spellLetters(const std::string& tok) {
         out += nm;
     }
     return out;
+}
+
+static inline bool ieq(char a, char b) {
+    return toLowerAscii(a) == toLowerAscii(b);
+}
+
+static inline bool isVowelLike(char c) {
+    c = toLowerAscii(c);
+    return c == 'a' || c == 'e' || c == 'i' || c == 'o' || c == 'u' || c == 'y';
+}
+
+static inline bool tokenHasVowel3(const std::string& s, size_t i) {
+    return isVowelLike(s[i]) || isVowelLike(s[i + 1]) || isVowelLike(s[i + 2]);
+}
+
+static inline bool tokenHasAnyVowel(const std::string& s, size_t i, size_t len) {
+    // Assumes i+len is in-bounds.
+    for (size_t k = 0; k < len; k++) {
+        if (isVowelLike(s[i + k])) return true;
+    }
+    return false;
 }
 
 static bool parseULL_10(const std::string& digits, unsigned long long& outVal) {
@@ -419,6 +449,8 @@ static std::string convertDigitRunToWords(const std::string& digits) {
 static std::string normalizeFragileTokens(const std::string& in) {
     std::string out;
     out.reserve(in.size() * 2);
+    const bool inEndsWithSpace = (!in.empty() && isSpaceLike(in.back()));
+
 
     size_t i = 0;
     while (i < in.size()) {
@@ -639,6 +671,49 @@ static std::string normalizeFragileTokens(const std::string& in) {
                 j++;
             }
             size_t len = j - i;
+            // Short 3-letter tokens:
+            // - Keep real words as words ("run", "nor", "pip", "pop", ...).
+            // - Expand a few common abbreviations / short forms that FlexVoice tends to drop.
+            // - Spell 3-letter code-y tokens that have no vowel (handled further below).
+            if (len == 3) {
+                // "etc" -> "etcetera" (don't spell as letters)
+                if (ieq(in[i], 'e') && ieq(in[i + 1], 't') && ieq(in[i + 2], 'c')) {
+                    appendWordWithBoundaries(out, "etcetera", true);
+                    i = j;
+                    continue;
+                }
+
+                // "nul" -> "null"
+                if (ieq(in[i], 'n') && ieq(in[i + 1], 'u') && ieq(in[i + 2], 'l')) {
+                    appendWordWithBoundaries(out, "null", true);
+                    i = j;
+                    continue;
+                }
+
+                // These are only applied when the token is NOT all-caps, so "COL" can still be spelled.
+                if (!allCaps) {
+                    if (ieq(in[i], 'c') && ieq(in[i + 1], 'o') && ieq(in[i + 2], 'l')) {
+                        appendWordWithBoundaries(out, "cole", true);
+                        i = j;
+                        continue;
+                    }
+                    if (ieq(in[i], 'b') && ieq(in[i + 1], 'o') && ieq(in[i + 2], 'r')) {
+                        appendWordWithBoundaries(out, "bore", true);
+                        i = j;
+                        continue;
+                    }
+                    if (ieq(in[i], 'p') && ieq(in[i + 1], 'u') && ieq(in[i + 2], 'r')) {
+                        appendWordWithBoundaries(out, "purr", true);
+                        i = j;
+                        continue;
+                    }
+                    if (ieq(in[i], 'k') && ieq(in[i + 1], 'i') && ieq(in[i + 2], 'k')) {
+                        appendWordWithBoundaries(out, "kick", true);
+                        i = j;
+                        continue;
+                    }
+                }
+            }
 
             // URL scheme ("https://"):
             // The engine often drops "https" or treats it as noise.
@@ -657,6 +732,19 @@ static std::string normalizeFragileTokens(const std::string& in) {
 
             // ALL-CAPS short token -> spell letters
             if (allCaps && len >= 2 && len <= 6) {
+                std::string spelled = spellLetters(in.substr(i, len));
+                if (!spelled.empty()) {
+                    appendWordWithBoundaries(out, spelled.c_str(), true);
+                    i = j;
+                    continue;
+                }
+            }
+            // Consonant-only tokens (no vowels) often get dropped by FlexVoice
+            // ("msgs", "http", "https", "src", ...). Spell them as letter-names so something is spoken.
+            //
+            // Keep a sane length cap so we don't turn giant hashes into minutes of spelling.
+            // (Raised to 128 so random long consonant-runs still speak.)
+            if (len >= 2 && len <= 128 && !tokenHasAnyVowel(in, i, len)) {
                 std::string spelled = spellLetters(in.substr(i, len));
                 if (!spelled.empty()) {
                     appendWordWithBoundaries(out, spelled.c_str(), true);
@@ -690,6 +778,15 @@ static std::string normalizeFragileTokens(const std::string& in) {
             const char nextCh = (i + 1 < in.size()) ? in[i + 1] : '\0';
 
             // Between token characters, spell common technical separators.
+
+            // Always break "://" so FlexVoice doesn't treat it as a URL and drop the scheme.
+            if (c == ':' && (i + 2 < in.size()) && in[i + 1] == '/' && in[i + 2] == '/') {
+                appendWordWithBoundaries(out, "colon", true);
+                appendWordWithBoundaries(out, "slash", true);
+                appendWordWithBoundaries(out, "slash", true);
+                i += 3;
+                continue;
+            }
             if (c == '.' && isAsciiAlnum(prevCh) && isAsciiAlnum(nextCh)) {
                 appendWordWithBoundaries(out, "dot", true);
                 i++;
@@ -728,7 +825,13 @@ static std::string normalizeFragileTokens(const std::string& in) {
         }
     }
 
-    while (!out.empty() && out.back() == ' ') out.pop_back();
+    if (inEndsWithSpace) {
+        // Keep exactly one trailing space if the input ended with whitespace.
+        while (!out.empty() && out.back() == ' ') out.pop_back();
+        out.push_back(' ');
+    } else {
+        while (!out.empty() && out.back() == ' ') out.pop_back();
+    }
     return out;
 }
 
