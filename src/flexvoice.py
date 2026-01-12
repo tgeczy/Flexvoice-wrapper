@@ -21,6 +21,14 @@ import ctypes
 import threading
 import queue
 import time
+
+# audioop is stdlib and implemented in C (fast) - useful for PCM silence analysis.
+# It may be missing in some future Python builds; keep a soft fallback.
+try:
+	import audioop
+except Exception:
+	audioop = None
+
 from dataclasses import dataclass
 from collections import deque
 from ctypes import (
@@ -60,6 +68,146 @@ FVWRAP_ITEM_AUDIO = 1
 FVWRAP_ITEM_INDEX = 2
 FVWRAP_ITEM_DONE = 3
 FVWRAP_ITEM_ERROR = 4
+
+
+# --- Optional PCM silence trimming ---
+#
+# FlexVoice often adds leading/trailing silence around each engine request.
+# During say-all, NVDA can end up sending many short requests (e.g. per line),
+# which makes these silences audible as "gaps".
+#
+# We can shave off *small* amounts of near-zero PCM at the start/end of each
+# segment to make line-to-line flow smoother.
+#
+# This is deliberately conservative and only enabled for indexed utterances
+# (i.e. sequences containing IndexCommand), so normal speech isn't altered.
+_TRIM_SILENCE_ON_INDEXED_UTTERANCES = True
+
+# Max silence we will trim at the *start* of a segment (ms)
+_TRIM_LEADING_SILENCE_MS = 180
+
+# Hold back this much audio (ms) so we can safely trim trailing silence.
+# Setting this to 0 disables trailing trimming (leading trim still works).
+_TRIM_TAIL_HOLDBACK_MS = 350
+
+# Max silence we will trim at the *end* of a segment (ms)
+# Should be <= _TRIM_TAIL_HOLDBACK_MS.
+_TRIM_TRAILING_SILENCE_MS = 350
+
+# Keep a tiny tail (ms) even if it's silent, to avoid "hard" joins/clicks.
+_TRIM_KEEP_TRAILING_MS = 10
+
+# Silence threshold in int16 absolute amplitude.
+# 0 is only true digital silence; 30-80 is a good "near-zero" range.
+_TRIM_SILENCE_THRESHOLD = 40
+
+# Debug logging (NVDA log) for trimmed ms amounts.
+_TRIM_DEBUG_LOG = False
+
+
+def _ms_to_frames(sr: int, ms: int) -> int:
+	if sr <= 0 or ms <= 0:
+		return 0
+	# integer math, rounded
+	return int((sr * ms) // 1000)
+
+
+def _trim_leading_silence_pcm16(
+	data: bytes,
+	channels: int,
+	thresh: int,
+	max_frames: int,
+) -> tuple[bytes, int, bool]:
+	"""Trim leading silence from 16-bit PCM.
+
+	Returns: (trimmedBytes, framesTrimmed, hitNonSilent)
+	"""
+	if not data or channels <= 0 or max_frames <= 0:
+		return data, 0, False
+
+	frame_bytes = channels * 2
+	frame_count = len(data) // frame_bytes
+	if frame_count <= 0:
+		return b"", 0, False
+
+	max_frames = min(max_frames, frame_count)
+	# Ensure we only view whole frames
+	view_bytes = max_frames * frame_bytes
+	mv = memoryview(data)[:view_bytes]
+	if (len(mv) % 2) != 0:
+		mv = mv[:-1]
+	try:
+		samples = mv.cast('h')
+	except Exception:
+		# Shouldn't happen on NVDA's Windows Python, but be safe.
+		return data, 0, False
+
+	frames_trimmed = 0
+	for f in range(max_frames):
+		base = f * channels
+		# Any channel above threshold counts as non-silence.
+		for ch in range(channels):
+			if abs(int(samples[base + ch])) > thresh:
+				# Found first non-silent frame.
+				start_byte = f * frame_bytes
+				return data[start_byte:], frames_trimmed, True
+		frames_trimmed += 1
+
+	# All silent in the scanned window.
+	return data[frames_trimmed * frame_bytes:], frames_trimmed, False
+
+
+def _trim_trailing_silence_pcm16(
+	data: bytes,
+	channels: int,
+	thresh: int,
+	max_frames: int,
+	keep_frames: int,
+) -> bytes:
+	"""Trim trailing silence from 16-bit PCM (conservative).
+
+	Only trims within the last max_frames. Keeps keep_frames after the last
+	non-silent frame to avoid overly tight joins.
+	"""
+	if not data or channels <= 0 or max_frames <= 0:
+		return data
+
+	frame_bytes = channels * 2
+	total_frames = len(data) // frame_bytes
+	if total_frames <= 0:
+		return b""
+
+	max_frames = min(max_frames, total_frames)
+	keep_frames = max(0, min(keep_frames, total_frames))
+
+	# View whole frames
+	mv = memoryview(data)[: total_frames * frame_bytes]
+	if (len(mv) % 2) != 0:
+		mv = mv[:-1]
+	try:
+		samples = mv.cast('h')
+	except Exception:
+		return data
+
+	scan_start = total_frames - max_frames
+	last_non_silent = None
+	for f in range(total_frames - 1, scan_start - 1, -1):
+		base = f * channels
+		for ch in range(channels):
+			if abs(int(samples[base + ch])) > thresh:
+				last_non_silent = f
+				break
+		if last_non_silent is not None:
+			break
+
+	if last_non_silent is None:
+		# Entire scan window is silent.
+		new_end = scan_start
+	else:
+		new_end = last_non_silent + 1
+
+	new_end = min(total_frames, new_end + keep_frames)
+	return data[: new_end * frame_bytes]
 
 
 def _clampPercent(v: int) -> int:
@@ -147,7 +295,9 @@ def _sanitizeTextForEngine(s: str) -> str:
 	for ch in s:
 		o = ord(ch)
 		if ch in ("\r", "\n", "\t"):
-			out.append(ch)
+			# FlexVoice tends to insert a noticeable pause on hard line breaks.
+			# Converting them to spaces keeps flow smoother for say-all.
+			out.append(" ")
 			continue
 		if o < 0x20 or o == 0x7F:
 			out.append(" ")
@@ -682,7 +832,7 @@ class SynthDriver(BaseSynthDriver):
 			if int(outType.value) == FVWRAP_ITEM_NONE:
 				return
 
-	def _runWrapperTextSegment(self, text: str, tokenSnapshot: int, sentIndexes: set[int]) -> bool:
+	def _runWrapperTextSegment(self, text: str, tokenSnapshot: int, sentIndexes: set[int], trimSilence: bool = False) -> bool:
 		"""
 		Speak one plain text segment through the wrapper, draining audio until DONE.
 
@@ -709,6 +859,25 @@ class SynthDriver(BaseSynthDriver):
 		buf = (c_ubyte * bufSize)()
 		outTp, outVal = c_int(), c_int()
 
+		# Optional (say-all) silence trimming state.
+		doTrim = bool(trimSilence) and int(self._bits) == 16 and int(self._channels) > 0
+		leadFramesLeft = _ms_to_frames(self._sr, _TRIM_LEADING_SILENCE_MS) if doTrim else 0
+		tailHoldMs = int(_TRIM_TAIL_HOLDBACK_MS) if doTrim else 0
+		trailTrimFrames = _ms_to_frames(self._sr, min(_TRIM_TRAILING_SILENCE_MS, _TRIM_TAIL_HOLDBACK_MS)) if (doTrim and tailHoldMs > 0) else 0
+		keepTrailFrames = _ms_to_frames(self._sr, _TRIM_KEEP_TRAILING_MS) if doTrim else 0
+		thresh = int(_TRIM_SILENCE_THRESHOLD) if doTrim else 0
+
+		frameBytes = int(self._channels) * 2
+		bytesPerSec = int(self._sr) * frameBytes if self._sr else 0
+		tailHoldBytes = ((bytesPerSec * tailHoldMs) // 1000) if (doTrim and bytesPerSec > 0 and tailHoldMs > 0) else 0
+		# Keep alignment.
+		if tailHoldBytes and frameBytes:
+			tailHoldBytes -= (tailHoldBytes % frameBytes)
+
+		tailBuf = bytearray()  # last tailHoldBytes we haven't fed yet
+		trimmedLeadFrames = 0
+		trimmedTrailFrames = 0
+
 		seenDone = False
 		lastActivity = time.time()
 
@@ -721,8 +890,36 @@ class SynthDriver(BaseSynthDriver):
 
 			if tp == FVWRAP_ITEM_AUDIO:
 				if n > 0:
-					self._playerFeed(bytes(buf[:n]))
-					lastActivity = time.time()
+					chunk = bytes(buf[:n])
+
+					# 1) Trim leading near-zero PCM (only at the very start of the segment).
+					if doTrim and leadFramesLeft > 0:
+						beforeLen = len(chunk)
+						chunk, framesTrimmed, hitNonSilent = _trim_leading_silence_pcm16(
+							chunk, int(self._channels), thresh, leadFramesLeft
+						)
+						leadFramesLeft -= framesTrimmed
+						trimmedLeadFrames += framesTrimmed
+						if hitNonSilent:
+							leadFramesLeft = 0
+						# If we trimmed everything and still haven't hit non-silence, this
+						# chunk may become empty; just wait for the next chunk.
+						if not chunk:
+							lastActivity = time.time()
+							continue
+
+					# 2) Hold back a small tail so we can trim trailing silence safely.
+					if doTrim and tailHoldBytes > 0:
+						tailBuf.extend(chunk)
+						if len(tailBuf) > tailHoldBytes:
+							emit = bytes(tailBuf[:-tailHoldBytes])
+							if emit:
+								self._playerFeed(emit)
+								lastActivity = time.time()
+							del tailBuf[:-tailHoldBytes]
+					else:
+						self._playerFeed(chunk)
+						lastActivity = time.time()
 				continue
 
 			if tp == FVWRAP_ITEM_INDEX:
@@ -750,9 +947,180 @@ class SynthDriver(BaseSynthDriver):
 				continue
 
 			if tp == FVWRAP_ITEM_NONE:
-				# Give a tiny tail window for late audio, then sync and return.
+				# Give a tiny tail window for late audio, then return.
+				# IMPORTANT: Do NOT sync the WavePlayer here. Syncing drains the playback buffer,
+				# which forces a gap between chunks (very noticeable during say-all).
+				# By returning as soon as we've *queued* all audio, we allow natural pipelining.
 				if seenDone and (time.time() - lastActivity > 0.05):
-					self._playerSync()
+					# Flush any held-back tail audio, optionally trimming trailing silence.
+					if tailBuf:
+						out = bytes(tailBuf)
+						if doTrim and trailTrimFrames > 0:
+							beforeFrames = len(out) // frameBytes if frameBytes else 0
+							out = _trim_trailing_silence_pcm16(
+								out, int(self._channels), thresh, trailTrimFrames, keepTrailFrames
+							)
+							afterFrames = len(out) // frameBytes if frameBytes else 0
+							trimmedTrailFrames = max(0, beforeFrames - afterFrames)
+						if out:
+							self._playerFeed(out)
+							tailBuf.clear()
+
+						if doTrim and _TRIM_DEBUG_LOG:
+							try:
+								leadMs = int((trimmedLeadFrames * 1000) // int(self._sr)) if self._sr else 0
+								trailMs = int((trimmedTrailFrames * 1000) // int(self._sr)) if self._sr else 0
+								log.debug(f"FlexVoice(trim): lead={leadMs}ms trail={trailMs}ms")
+							except Exception:
+								pass
+					return True
+				time.sleep(0.002)
+				continue
+
+		return False
+
+	def _runWrapperUtteranceComposite(self, utt: _Utt, tokenSnapshot: int, sentIndexes: set[int], trimSilence: bool = False) -> bool:
+		"""Run a single wrapper commit containing multiple text chunks and explicit indexes.
+
+		This reduces per-chunk engine resets during say-all, which helps avoid the
+		"gap" FlexVoice can insert between short requests.
+		"""
+		h = self._handle
+		if not h:
+			return False
+
+		self._applySettingsIfChanged()
+
+		try:
+			self._dll.fvwrap_begin(h)
+
+			for seg in utt.segments:
+				b = (seg.text or "").encode("utf-8", "replace")
+				if b:
+					self._dll.fvwrap_addTextUtf8(h, b)
+
+				# Tell the wrapper where NVDA index boundaries are.
+				for idx in seg.idxAfter:
+					try:
+						self._dll.fvwrap_addIndex(h, int(idx))
+					except Exception:
+						pass
+
+			rc = int(self._dll.fvwrap_commit(h, 1))
+			if rc != 0:
+				return False
+		except Exception:
+			return False
+
+		bufSize = 8192
+		buf = (c_ubyte * bufSize)()
+		outTp, outVal = c_int(), c_int()
+
+		# Optional (say-all) silence trimming state.
+		doTrim = bool(trimSilence) and int(self._bits) == 16 and int(self._channels) > 0
+		leadFramesLeft = _ms_to_frames(self._sr, _TRIM_LEADING_SILENCE_MS) if doTrim else 0
+		tailHoldMs = int(_TRIM_TAIL_HOLDBACK_MS) if doTrim else 0
+		trailTrimFrames = _ms_to_frames(self._sr, min(_TRIM_TRAILING_SILENCE_MS, _TRIM_TAIL_HOLDBACK_MS)) if (doTrim and tailHoldMs > 0) else 0
+		keepTrailFrames = _ms_to_frames(self._sr, _TRIM_KEEP_TRAILING_MS) if doTrim else 0
+		thresh = int(_TRIM_SILENCE_THRESHOLD) if doTrim else 0
+
+		frameBytes = int(self._channels) * 2
+		bytesPerSec = int(self._sr) * frameBytes if self._sr else 0
+		tailHoldBytes = ((bytesPerSec * tailHoldMs) // 1000) if (doTrim and bytesPerSec > 0 and tailHoldMs > 0) else 0
+		# Keep alignment.
+		if tailHoldBytes and frameBytes:
+			tailHoldBytes -= (tailHoldBytes % frameBytes)
+
+		tailBuf = bytearray()
+		trimmedLeadFrames = 0
+		trimmedTrailFrames = 0
+
+		seenDone = False
+		lastActivity = time.time()
+
+		while not self._shutdown.is_set():
+			if tokenSnapshot != self._getCancelToken():
+				return False
+
+			n = int(self._dll.fvwrap_read(h, byref(outTp), byref(outVal), buf, bufSize))
+			tp = int(outTp.value)
+
+			if tp == FVWRAP_ITEM_AUDIO:
+				if n > 0:
+					chunk = bytes(buf[:n])
+
+					# 1) Trim leading near-zero PCM (only at the very start of the utterance).
+					if doTrim and leadFramesLeft > 0:
+						chunk, framesTrimmed, hitNonSilent = _trim_leading_silence_pcm16(
+							chunk, int(self._channels), thresh, leadFramesLeft
+						)
+						leadFramesLeft -= framesTrimmed
+						trimmedLeadFrames += framesTrimmed
+						if hitNonSilent:
+							leadFramesLeft = 0
+						if not chunk:
+							lastActivity = time.time()
+							continue
+
+					# 2) Hold back a small tail so we can trim trailing silence safely.
+					if doTrim and tailHoldBytes > 0:
+						tailBuf.extend(chunk)
+						if len(tailBuf) > tailHoldBytes:
+							emit = bytes(tailBuf[:-tailHoldBytes])
+							if emit:
+								self._playerFeed(emit)
+								lastActivity = time.time()
+							del tailBuf[:-tailHoldBytes]
+					else:
+						self._playerFeed(chunk)
+						lastActivity = time.time()
+				continue
+
+			if tp == FVWRAP_ITEM_INDEX:
+				idx = int(outVal.value)
+				if idx not in sentIndexes:
+					sentIndexes.add(idx)
+					try:
+						synthIndexReached.notify(synth=self, index=idx)
+					except Exception:
+						pass
+				lastActivity = time.time()
+				continue
+
+			if tp == FVWRAP_ITEM_DONE:
+				seenDone = True
+				lastActivity = time.time()
+				continue
+
+			if tp == FVWRAP_ITEM_ERROR:
+				seenDone = True
+				lastActivity = time.time()
+				continue
+
+			if tp == FVWRAP_ITEM_NONE:
+				# Same policy as _runWrapperTextSegment: don't sync here for indexed utterances.
+				if seenDone and (time.time() - lastActivity > 0.05):
+					if tailBuf:
+						out = bytes(tailBuf)
+						if doTrim and trailTrimFrames > 0 and frameBytes:
+							beforeFrames = len(out) // frameBytes
+							out = _trim_trailing_silence_pcm16(
+								out, int(self._channels), thresh, trailTrimFrames, keepTrailFrames
+							)
+							afterFrames = len(out) // frameBytes
+							trimmedTrailFrames = max(0, beforeFrames - afterFrames)
+						if out:
+							self._playerFeed(out)
+							tailBuf.clear()
+
+						if doTrim and _TRIM_DEBUG_LOG:
+							try:
+								leadMs = int((trimmedLeadFrames * 1000) // int(self._sr)) if self._sr else 0
+								trailMs = int((trimmedTrailFrames * 1000) // int(self._sr)) if self._sr else 0
+								log.debug(f"FlexVoice(trim): lead={leadMs}ms trail={trailMs}ms")
+							except Exception:
+								pass
+
 					return True
 				time.sleep(0.002)
 				continue
@@ -792,28 +1160,26 @@ class SynthDriver(BaseSynthDriver):
 					pass
 			return True
 
-		# Speak each segment; after segment completes (audio fully played), fire indexes after it.
-		for seg in utt.segments:
-			if utt.token != self._getCancelToken() or self._shutdown.is_set():
-				return False
 
-			ok = self._runWrapperTextSegment(seg.text, utt.token, sentIndexes)
+		trim = bool(_TRIM_SILENCE_ON_INDEXED_UTTERANCES and utt.expectedIndexes)
+
+		# For say-all / caret tracking (indexed utterances), send one *combined* wrapper request
+		# with explicit index markers. This avoids restarting the engine for each segment.
+		if utt.expectedIndexes:
+			ok = self._runWrapperUtteranceComposite(utt, utt.token, sentIndexes, trimSilence=trim)
 			if not ok:
 				return False
-
-			# After audio is synced for this segment, emit the boundary indexes.
-			for idx in seg.idxAfter:
+		else:
+			# Non-indexed speech: keep the existing simple behavior.
+			for seg in utt.segments:
 				if utt.token != self._getCancelToken() or self._shutdown.is_set():
 					return False
-				if idx in sentIndexes:
-					continue
-				sentIndexes.add(idx)
-				try:
-					synthIndexReached.notify(synth=self, index=int(idx))
-				except Exception:
-					pass
+				ok = self._runWrapperTextSegment(seg.text, utt.token, sentIndexes, trimSilence=False)
+				if not ok:
+					return False
 
 		# Fallback: emit any missing expected indexes (should be none in normal operation).
+
 		for idx in utt.expectedIndexes:
 			if idx in sentIndexes:
 				continue
@@ -823,7 +1189,17 @@ class SynthDriver(BaseSynthDriver):
 			except Exception:
 				pass
 
+		# If there were no IndexCommands at all, we assume NVDA is using synthDoneSpeaking
+		# as the boundary for this utterance. In that case, keep behavior accurate by
+		# waiting until the WavePlayer buffer drains.
+		#
+		# If IndexCommands are present (say-all / caret tracking), we intentionally skip
+		# syncing here to allow pipelining across chunks and avoid line-to-line pauses.
+		if not utt.expectedIndexes:
+			self._playerSync()
+
 		return True
+
 
 	def _workerLoop(self):
 		while not self._shutdown.is_set():
