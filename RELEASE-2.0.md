@@ -77,8 +77,14 @@ why the two sound so alike.)
   that started slowly — right after a language switch, or with the host under
   load — was dropped as silence: the "skipping CD" bug. `DONE` is now held
   until audio has actually been queued.
-- Switching language now refreshes the voice list in an open settings dialog;
-  previously it kept offering the old language's voices.
+- The engine's foreign-word detector is switched off for Hungarian. It was
+  spotting English words and pronouncing them in English — and doing it badly,
+  which is what turned *desktop* into something like "dekeiop" while *set*
+  stayed fine. Foreign words now read with Hungarian letter-to-sound
+  (*desktop* → "deszktop"), which is what a Hungarian screen-reader user
+  expects. Hungarian words were never affected either way.
+- Consonant-only tokens like `VLC` and `CMD` are spelled with Hungarian letter
+  names (*ve el ce*) instead of being skipped.
 - The 32-bit host returned on the first `DONE`, but the wrapper emits `DONE`
   before the engine's audio arrives — utterances could be truncated to silence.
 - A missing `_ipc.py` removed the whole synthesizer from NVDA's list instead of
@@ -168,8 +174,14 @@ más hangszínszabályzóval. Ha évek óta Tim a megszokott hang, az változatl
 - A `DONE` a hang első csomagja előtt érhetett az olvasóhoz, így a lassan
   induló mondat — nyelvváltás után, vagy terhelt gazdafolyamatnál — némaságként
   veszett el: az „ugráló CD" hiba. A `DONE` mostantól megvárja a hangot.
-- A nyelvváltás frissíti a nyitott beállítópanel hanglistáját; korábban a
-  régi nyelv hangjait kínálta tovább.
+- A motor idegenszó-felismerője magyarnál kikapcsolva. Angol szavakat ismert
+  fel és angolul ejtette őket — méghozzá rosszul, ettől lett a *desktop*
+  „dekeiop", miközben a *set* rendben volt. Az idegen szavak mostantól magyar
+  betű-hang megfeleltetéssel szólalnak meg (*desktop* → „deszktop"), ahogyan
+  egy magyar képernyőolvasót használó ember várja. A magyar szavakat ez soha
+  nem érintette.
+- A csak mássalhangzókból álló tokenek, mint a `VLC` vagy a `CMD`, magyar
+  betűnevekkel szólalnak meg (*vé el cé*), nem maradnak ki.
 - A 32 bites gazdafolyamat az első `DONE` jelre visszatért, a csomagoló viszont
   a hang megérkezése *előtt* küldi a `DONE`-t — a mondatok némaságra
   csonkulhattak.
