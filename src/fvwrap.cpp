@@ -1125,6 +1125,55 @@ static std::string utf8ToHungarianBytes(const char* sUtf8) {
 
     out = hungarianExpandDigits(out);
 
+    // Consonant-only tokens ("vlc", "cmd") never get read by the fragment
+    // path, while the native normalizer spells them with Hungarian letter
+    // names - Say.exe renders "vlc" as ve el ce. Do the same here. Every
+    // accented Hungarian letter is a vowel and lives at >= 0x80 in CP1250, so
+    // "has a vowel" is: contains aeiou or any high byte.
+    {
+        std::string spelled;
+        spelled.reserve(out.size() + 16);
+        size_t i2 = 0;
+        while (i2 < out.size()) {
+            const char c0 = out[i2];
+            const bool isWord = isAsciiAlpha(c0) || (unsigned char)c0 >= 0x80;
+            if (!isWord) {
+                spelled.push_back(c0);
+                i2++;
+                continue;
+            }
+            size_t j2 = i2;
+            bool hasVowel = false;
+            while (j2 < out.size()) {
+                const char c = out[j2];
+                if (isAsciiAlpha(c)) {
+                    const char lc = toLowerAscii(c);
+                    if (lc == 'a' || lc == 'e' || lc == 'i' || lc == 'o' || lc == 'u') {
+                        hasVowel = true;
+                    }
+                } else if ((unsigned char)c >= 0x80) {
+                    hasVowel = true;   // all CP1250 Hungarian letters are vowels
+                } else {
+                    break;
+                }
+                j2++;
+            }
+            const size_t len = j2 - i2;
+            if (!hasVowel && len >= 2 && len <= 8) {
+                for (size_t k = i2; k < j2; k++) {
+                    const char* nm = hungarianLetterName(toLowerAscii(out[k]));
+                    if (k > i2) spelled.push_back(' ');
+                    if (nm) spelled += nm;
+                    else spelled.push_back(out[k]);
+                }
+            } else {
+                spelled.append(out, i2, len);
+            }
+            i2 = j2;
+        }
+        out.swap(spelled);
+    }
+
     // Intra-word hyphens are another fragment-path killer: "e-mail",
     // "szoba-konyha" and "eti-eloquence" all render to 2 bytes of silence,
     // while "ha - akkor" (spaced) is fine. The native normalizer reads a

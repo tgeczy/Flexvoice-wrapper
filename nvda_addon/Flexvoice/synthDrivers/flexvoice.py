@@ -55,10 +55,12 @@ def _dropVoiceListCaches(synth) -> None:
 
 	SynthDriver._get_availableVoices caches its result in the instance
 	attribute ``_availableVoices`` (``_availableVariants`` for variants) -
-	verified in NVDA's own synthDriverHandler. AutoPropertyObject's
-	invalidateCache() does NOT clear these, so after a language switch the old
-	language's voices kept being served: the GUI listed Hungarian voices with
-	English selected, one language behind, while the host itself was correct.
+	verified in NVDA's own synthDriverHandler; invalidateCache() does not
+	clear those.
+
+	The voice list no longer changes with language, so this is not needed for
+	the language switch any more. It is kept for the config-restore path,
+	where the set of shipped languages can differ from the last run.
 	"""
 	for attr in ("_availableVoices", "_availableVariants"):
 		try:
@@ -73,55 +75,51 @@ def _dropVoiceListCaches(synth) -> None:
 
 def _scheduleVoiceSettingsRefresh() -> None:
 	"""
-	Rebuild the Voice combo in an open NVDA settings dialog after a language
-	switch.
+	Ask an open NVDA settings dialog to re-read our settings.
 
-	updateDriverSettings() cannot do this - read straight from NVDA's
-	settingsDialogs bytecode: _makeStringSettingControl builds the item list
-	ONCE and stores the VoiceInfo list on the panel as ``_voices``;
-	_updateValueForControl only ever calls SetSelection. Worse, the EVT_CHOICE
-	handler (StringDriverSettingChanger) maps the click through
-	``panel._voices[GetSelection()]`` - so with a stale list the user picks
-	what LOOKS like a Hungarian voice, the handler resolves it to an English
-	VoiceInfo, and the language snaps right back. All three must be replaced
-	by hand: ``panel._voices``, the combo items, and the selection.
+	Only the *selection* of the Voice combo can be moved this way, never its
+	items - but since the voice list is the same for every language, moving
+	the selection is all that is required.
 
-	Runs only where wx exists - in NVDA's own process. Inside the 32-bit
-	bridge host the import fails and this is a no-op; the 64-bit proxy does
-	the refresh there instead.
+	The panel is found by walking the wx window tree rather than
+	NVDASettingsDialog.catIdToInstanceMap: that map holds category panels, and
+	the AutoSettingsMixin panel carrying the driver settings is nested inside
+	one, so an isinstance check against the map's values silently matched
+	nothing.
+
+	Runs only where wx exists - NVDA's own process. Inside the 32-bit bridge
+	host the import fails and this is a no-op.
 	"""
 	try:
 		import wx
-		from gui import settingsDialogs
+		from autoSettingsUtils.autoSettings import AutoSettings  # noqa: F401
+		from gui.settingsDialogs import AutoSettingsMixin
 	except Exception:
 		return
 
+	def _walk(win, depth=0):
+		if depth > 8:
+			return
+		yield win
+		try:
+			children = win.GetChildren()
+		except Exception:
+			return
+		for child in children:
+			yield from _walk(child, depth + 1)
+
 	def _do():
 		try:
-			for win in wx.GetTopLevelWindows():
-				if not isinstance(win, settingsDialogs.NVDASettingsDialog):
+			for top in wx.GetTopLevelWindows():
+				if not top.IsShown():
 					continue
-				for panel in win.catIdToInstanceMap.values():
-					if not isinstance(panel, settingsDialogs.VoiceSettingsPanel):
+				for win in _walk(top):
+					if not isinstance(win, AutoSettingsMixin):
 						continue
-					combo = getattr(panel, "voiceList", None)
-					if combo is None:
-						break
 					try:
-						driver = panel.getSettings()
-						infos = list(driver.availableVoices.values())
-						panel._voices = infos
-						combo.SetItems([v.displayName for v in infos])
-						ids = [v.id for v in infos]
-						cur = driver.voice
-						if cur in ids:
-							combo.SetSelection(ids.index(cur))
-						elif infos:
-							combo.SetSelection(0)
+						win.updateDriverSettings(changedSetting="language")
 					except Exception:
-						log.debugWarning("FlexVoice: voice combo rebuild failed", exc_info=True)
-					break
-				break
+						log.debugWarning("FlexVoice: updateDriverSettings failed", exc_info=True)
 		except Exception:
 			log.debugWarning("FlexVoice: settings panel refresh failed", exc_info=True)
 
@@ -576,12 +574,22 @@ class SynthDriver(BaseSynthDriver):
 				raise RuntimeError("FlexVoice: no language data found")
 			self._langDirs = {"en": legacy}
 
+		# One voice list spanning every language, built once and never rebuilt.
+		# An open NVDA combo box cannot have its items replaced (see
+		# _getAvailableVoices), so the list has to be stable; the language of a
+		# voice travels with it instead.
+		self._voiceLang: dict[str, str] = {}   # voice id -> nvda language
+		self._voiceMap: dict[str, str] = {}    # voice id -> .tav path
+		for nvdaLang, langDir in self._langDirs.items():
+			for vid, path in _parseVoiceList(os.path.join(langDir, "VoiceList.tvl"), langDir).items():
+				self._voiceMap[vid] = path
+				self._voiceLang[vid] = nvdaLang
+		self._voiceIds = sorted(self._voiceMap.keys(), key=lambda s: s.lower())
+		if not self._voiceIds:
+			raise RuntimeError("FlexVoice: no voices found")
+
 		self._language = _DEFAULT_LANG if _DEFAULT_LANG in self._langDirs else sorted(self._langDirs)[0]
-		self._langDir = ""
-		self._voiceMap: dict[str, str] = {}
-		self._voiceIds: list[str] = []
-		self._voice = "Default"
-		self._loadVoicesForLanguage(self._language)
+		self._voice = self._defaultVoiceFor(self._language)
 
 		# 5) Engine init (via _flexvoice abstraction)
 		self._engine = _flexvoice.create_engine(self._wrapperPath, [self._baseDir, self._addonRoot])
@@ -648,36 +656,38 @@ class SynthDriver(BaseSynthDriver):
 	# Voice picked when a language is selected for the first time.
 	_PREFERRED_VOICE = {"en": "Tom", "hu": "Zita"}
 
-	def _loadVoicesForLanguage(self, nvdaLang: str, keepVoice: str | None = None) -> None:
-		"""
-		Point the driver at one language's data folder and rebuild the voice list.
-		Does not touch the engine; the caller decides when to recreate it.
-		"""
-		langDir = self._langDirs.get(nvdaLang) or self._langDirs.get(_DEFAULT_LANG)
-		if not langDir:
-			langDir = self._langDirs[sorted(self._langDirs)[0]]
-
-		self._language = nvdaLang
-		self._langDir = langDir
-		self._voiceMap = _parseVoiceList(os.path.join(langDir, "VoiceList.tvl"), langDir)
-		# "Default" is deliberately not offered: it resolves to default.tav, which
-		# is just one of the named voices again (Julie for English, Zita for
-		# Hungarian), and it would mean something different after a language
-		# switch. _set_voice still accepts it for configs that name it.
-		self._voiceIds = sorted(self._voiceMap.keys(), key=lambda s: s.lower())
-
-		want = keepVoice or self._PREFERRED_VOICE.get(nvdaLang)
-		if want in self._voiceIds:
-			self._voice = want
-		else:
-			# Fall back to a real voice, so the name NVDA reports matches what
-			# is actually speaking.
-			self._voice = self._voiceIds[0] if self._voiceIds else "Default"
+	def _defaultVoiceFor(self, nvdaLang: str) -> str:
+		"""First choice of voice when *nvdaLang* becomes active."""
+		want = self._PREFERRED_VOICE.get(nvdaLang)
+		if want in self._voiceMap and self._voiceLang.get(want) == nvdaLang:
+			return want
+		for vid in self._voiceIds:
+			if self._voiceLang.get(vid) == nvdaLang:
+				return vid
+		return self._voiceIds[0]
 
 	def _getAvailableVoices(self):
+		"""
+		Every voice of every language, always, in one stable list.
+
+		This is deliberate, and it is the only arrangement that works. An open
+		combo box in NVDA's settings cannot have its items replaced: read from
+		gui/settingsDialogs, _makeStringSettingControl builds the items once and
+		stores the VoiceInfo list on the panel as _voices, _updateValueForControl
+		only ever calls SetSelection, and the EVT_CHOICE handler maps a click
+		through panel._voices[GetSelection()]. Filtering this list per language
+		therefore did not merely look stale - clicking the visibly-Hungarian
+		list resolved to an English VoiceInfo and bounced the language back.
+
+		With one fixed list none of that can happen: NVDA only ever has to move
+		the selection, which it does correctly by itself. Each VoiceInfo carries
+		its own language, and picking a voice switches the engine to it. This is
+		also how eSpeak and OneCore present themselves, and how TGSpeechBox
+		sidesteps the same limitation.
+		"""
 		return {
-			name: VoiceInfo(name, name, self._language)
-			for name in self._voiceIds
+			vid: VoiceInfo(vid, vid, self._voiceLang.get(vid, self._language))
+			for vid in self._voiceIds
 		}
 
 	def _get_availableLanguages(self):
@@ -702,43 +712,30 @@ class SynthDriver(BaseSynthDriver):
 		if val not in self._langDirs:
 			log.warning(f"FlexVoice: no data for language {val!r}, ignoring")
 			return
-		self._loadVoicesForLanguage(val)
-		self._needsRecreate = True
-		self.cancel()
-		self._cmdQ.put((_CMD_RECREATE, None))
-		_dropVoiceListCaches(self)
-		# On 32-bit NVDA this driver runs in NVDA's own process, so the open
-		# settings dialog is ours to refresh. In the bridge host wx is absent
-		# and this no-ops; the 64-bit proxy handles the dialog there.
-		_scheduleVoiceSettingsRefresh()
+		self._language = val
+		# Move to a voice that actually speaks it. The voice list itself does
+		# not change, so NVDA only has to move the combo's selection - which
+		# StringDriverSettingChanger already asks it to do after this returns.
+		self._voice = self._defaultVoiceFor(val)
+		self._restartEngine()
 
 	def _get_voice(self):
 		return self._voice
 
 	def _set_voice(self, val):
-		if val == "Default":
-			# No longer offered as a choice, but a config saved by an older
-			# build can still name it. Honour it as "this language's default".
-			val = self._PREFERRED_VOICE.get(self._language) or val
+		if val == "Default" or val not in self._voiceMap:
+			# Configs from older builds can name "Default", or a voice that is
+			# no longer shipped. Fall back rather than refusing to speak.
+			if val not in self._voiceMap:
+				val = self._defaultVoiceFor(self._language)
 		if val == self._voice:
 			return
-		if val not in self._voiceIds:
-			# Selecting a voice from the other language implies a language switch.
-			for nvdaLang, langDir in self._langDirs.items():
-				if nvdaLang == self._language:
-					continue
-				others = _parseVoiceList(os.path.join(langDir, "VoiceList.tvl"), langDir)
-				if val in others:
-					self._loadVoicesForLanguage(nvdaLang, keepVoice=val)
-					self._needsRecreate = True
-					self.cancel()
-					self._cmdQ.put((_CMD_RECREATE, None))
-					_dropVoiceListCaches(self)
-					_scheduleVoiceSettingsRefresh()
-					return
-			log.warning(f"FlexVoice: unknown voice {val!r}, ignoring")
-			return
 		self._voice = val
+		# The language travels with the voice: choosing Zita means Hungarian.
+		self._language = self._voiceLang.get(val, self._language)
+		self._restartEngine()
+
+	def _restartEngine(self):
 		self._needsRecreate = True
 		self.cancel()
 		self._cmdQ.put((_CMD_RECREATE, None))
@@ -764,20 +761,23 @@ class SynthDriver(BaseSynthDriver):
 
 	# ---------------- Internals ----------------
 	def _speakerPathForVoice(self, voiceName: str) -> str:
-		if voiceName and voiceName != "Default":
-			p = self._voiceMap.get(voiceName)
-			if p and os.path.isfile(p):
-				return p
+		p = self._voiceMap.get(voiceName)
+		if p and os.path.isfile(p):
+			return p
+		langDir = self._langDirs.get(self._language) or ""
 		# Both spellings occur in the wild: English ships default.tav, the
 		# Hungarian data ships Default.tav.
 		for name in ("default.tav", "Default.tav"):
-			p = os.path.join(self._langDir, name)
-			if os.path.isfile(p):
-				return p
-		return os.path.join(self._langDir, "default.tav")
+			cand = os.path.join(langDir, name)
+			if os.path.isfile(cand):
+				return cand
+		return os.path.join(langDir, "default.tav")
 
 	def _createEngineOrDie(self):
-		langDir = self._langDir
+		# The voice decides the language: they can only disagree transiently,
+		# and the voice is what the user actually hears.
+		self._language = self._voiceLang.get(self._voice, self._language)
+		langDir = self._langDirs.get(self._language) or ""
 		# EngineFactory wants the folder that CONTAINS the per-language folders;
 		# it appends the language itself. Handing it a single language folder
 		# happens to work when English is the only one present, but starts
@@ -1540,29 +1540,21 @@ if ctypes.sizeof(ctypes.c_void_p) == 8 and _Proxy32 is not None:
 				self._cachedLanguage = self._remoteService.getParam("language")
 			except Exception:
 				self._cachedLanguage = None
-			# The host rebuilt its voice list for the new language. The proxy
-			# inherits SynthDriver's _get_availableVoices, which caches in the
-			# _availableVoices instance attribute - drop it, or this side keeps
-			# serving the previous language's list no matter what the host says.
-			_dropVoiceListCaches(self)
-			# And the open settings dialog still shows the old language's
-			# voices; dropping our cache does not redraw its combo.
+			# The voice list is language-independent, so it does not need
+			# rebuilding - but the host moved to a different voice, and the
+			# open dialog should show that. Only the selection changes, which
+			# updateDriverSettings can do.
 			_scheduleVoiceSettingsRefresh()
 
 		def _set_voice(self, value):
-			# The host treats picking a voice from the other language as a
-			# language switch (config restore from an older build, mostly).
-			# When that happens this side's language and voice-list caches
-			# must follow, or they end up one language behind again.
+			# The language travels with the voice on the host side, so this
+			# side's cached language has to follow - otherwise NVDA keeps
+			# tagging speech with the previous language.
 			super()._set_voice(value)
 			try:
-				remoteLang = self._remoteService.getParam("language")
+				self._cachedLanguage = self._remoteService.getParam("language")
 			except Exception:
-				return
-			if remoteLang != self._cachedLanguage:
-				self._cachedLanguage = remoteLang
-				_dropVoiceListCaches(self)
-				_scheduleVoiceSettingsRefresh()
+				self._cachedLanguage = None
 
 		def _get_availableLanguages(self):
 			# Computed locally rather than over the wire: the data folders are on
