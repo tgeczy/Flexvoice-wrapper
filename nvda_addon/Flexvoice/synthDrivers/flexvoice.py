@@ -78,10 +78,13 @@ _LANGUAGES = (
 _LANG_BY_ID = {nvdaLang: (dirName, engineId) for nvdaLang, dirName, engineId in _LANGUAGES}
 _DEFAULT_LANG = "en"
 
-# Older releases shipped the English banks under invented names. Both were exact
-# renames (Tim.tav carried voiceDescr="Tom", Kim.tav carried voiceDescr="Julie"),
-# so a saved config naming them maps cleanly onto the real voices.
-_LEGACY_VOICE_IDS = {"Tim": "Tom", "Kim": "Julie"}
+# Tim and Kim are NOT aliases of Tom and Julie, despite sharing their diphone
+# banks (Tim.tav carries voiceDescr="Tom", Kim.tav carries voiceDescr="Julie").
+# The voice shaping differs substantially -- Tim is pitch 105 at 163 wpm with
+# tilt 0, Tom is pitch 95 at 137 wpm with tilt 31, and their equalizer curves
+# differ in both Q and gain. Tim.tav is in fact byte-identical to Ben.tav apart
+# from voiceDescr, i.e. Ben's voice driving Tom's bank, which is why Tim and Ben
+# sound so alike. Both ship, so long-time users keep the voice they know.
 
 # Wrapper stream item types (from _flexvoice)
 FVWRAP_ITEM_NONE = _flexvoice.FVWRAP_ITEM_NONE
@@ -575,15 +578,19 @@ class SynthDriver(BaseSynthDriver):
 		self._language = nvdaLang
 		self._langDir = langDir
 		self._voiceMap = _parseVoiceList(os.path.join(langDir, "VoiceList.tvl"), langDir)
-		self._voiceIds = ["Default"] + sorted(self._voiceMap.keys(), key=lambda s: s.lower())
+		# "Default" is deliberately not offered: it resolves to default.tav, which
+		# is just one of the named voices again (Julie for English, Zita for
+		# Hungarian), and it would mean something different after a language
+		# switch. _set_voice still accepts it for configs that name it.
+		self._voiceIds = sorted(self._voiceMap.keys(), key=lambda s: s.lower())
 
 		want = keepVoice or self._PREFERRED_VOICE.get(nvdaLang)
 		if want in self._voiceIds:
 			self._voice = want
 		else:
-			# Fall back to the first real voice rather than "Default", so the
-			# name NVDA reports matches what is actually speaking.
-			self._voice = self._voiceIds[1] if len(self._voiceIds) > 1 else "Default"
+			# Fall back to a real voice, so the name NVDA reports matches what
+			# is actually speaking.
+			self._voice = self._voiceIds[0] if self._voiceIds else "Default"
 
 	def _getAvailableVoices(self):
 		return {
@@ -622,8 +629,10 @@ class SynthDriver(BaseSynthDriver):
 		return self._voice
 
 	def _set_voice(self, val):
-		# A config saved by an older build may still name Tim/Kim.
-		val = _LEGACY_VOICE_IDS.get(val, val)
+		if val == "Default":
+			# No longer offered as a choice, but a config saved by an older
+			# build can still name it. Honour it as "this language's default".
+			val = self._PREFERRED_VOICE.get(self._language) or val
 		if val == self._voice:
 			return
 		if val not in self._voiceIds:
@@ -1413,12 +1422,20 @@ if ctypes.sizeof(ctypes.c_void_p) == 8 and _Proxy32 is not None:
 		# and volume. 'language' is ours, so it has to be forwarded by hand or it
 		# silently does nothing under 64-bit NVDA while working fine in a
 		# 32-bit test harness.
+		#: Mirrors the host's language. NVDA reads synth.language while building
+		#: every utterance, and each read would otherwise be a round trip to
+		#: another process.
+		_cachedLanguage = None
+
 		def _get_language(self):
+			if self._cachedLanguage is not None:
+				return self._cachedLanguage
 			try:
-				return self._remoteService.getParam("language")
+				self._cachedLanguage = self._remoteService.getParam("language")
 			except Exception:
 				log.debugWarning("FlexVoice: could not read language from host", exc_info=True)
-				return _DEFAULT_LANG
+				self._cachedLanguage = _DEFAULT_LANG
+			return self._cachedLanguage
 
 		def _set_language(self, value):
 			try:
@@ -1426,17 +1443,15 @@ if ctypes.sizeof(ctypes.c_void_p) == 8 and _Proxy32 is not None:
 			except Exception:
 				log.error("FlexVoice: could not set language on host", exc_info=True)
 				return
-			# The host just rebuilt its voice list for the new language, so the
-			# cached one on this side is stale.
-			for attr in ("_availableVoices", "_voicesCache"):
-				try:
-					delattr(self, attr)
-				except Exception:
-					pass
+			self._cachedLanguage = value
+			# The host rebuilt its voice list for the new language, so every
+			# cached property on this side is stale - availableVoices above all.
+			# invalidateCache() is AutoPropertyObject's own API; clearing named
+			# private attributes would depend on proxy internals.
 			try:
 				self.invalidateCache()
 			except Exception:
-				pass
+				log.debugWarning("FlexVoice: invalidateCache failed", exc_info=True)
 
 		def _get_availableLanguages(self):
 			# Computed locally rather than over the wire: the data folders are on
