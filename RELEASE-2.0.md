@@ -10,6 +10,11 @@ Fourteen voices in total:
 | English (US) | Tom, Julie, Ben, Leslie, Tim, Kim + four 8 kHz "Phone" variants |
 | Hungarian | Zita, Péter + two "Phone" variants |
 
+All fourteen voices appear in one list, whichever language is selected — the
+language travels with the voice, so choosing Zita switches to Hungarian and
+choosing Leslie switches back. The **Language** combo is a shortcut: it moves
+you to that language's default voice (Tom for English, Zita for Hungarian).
+
 Tested on NVDA 2026.1 (64-bit, through NVDA's built-in 32-bit bridge). It should
 also work on 32-bit NVDA from 2024.4 onwards, where the driver runs in-process
 and needs no bridge — but that has not been tested, so reports are welcome.
@@ -98,6 +103,11 @@ váltani közöttük.
 |---|---|
 | Angol (amerikai) | Tom, Julie, Ben, Leslie, Tim, Kim + négy 8 kHz-es „Phone" változat |
 | Magyar | Zita, Péter + két „Phone" változat |
+
+Mind a tizennégy hang egyetlen listában jelenik meg, bármelyik nyelv is aktív —
+a nyelv a hanggal együtt jár, tehát Zitát választva magyarra, Leslie-t választva
+angolra vált. A **Nyelv** lenyíló lista gyorsítás: az adott nyelv alapértelmezett
+hangjára ugrik (angolnál Tom, magyarnál Zita).
 
 Kipróbálva NVDA 2026.1 alatt (64 bites, az NVDA beépített 32 bites hídján
 keresztül). Elvben a 2024.4-től kezdődő 32 bites NVDA-kon is működik, ahol a
