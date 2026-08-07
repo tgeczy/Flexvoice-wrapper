@@ -73,14 +73,22 @@ def _dropVoiceListCaches(synth) -> None:
 
 def _scheduleVoiceSettingsRefresh() -> None:
 	"""
-	Rebuild the voice list in an open NVDA settings dialog after a language
-	switch. Without this the Voice combo keeps showing the previous language's
-	voices, and choosing one silently switches the language right back.
+	Rebuild the Voice combo in an open NVDA settings dialog after a language
+	switch.
 
-	Pattern borrowed from TGSpeechBox's driver: find the open NVDASettingsDialog
-	and ask its VoiceSettingsPanel to re-read our settings. Runs only where wx
-	exists - in NVDA's own process. Inside the 32-bit bridge host the import
-	fails and this is a no-op; the 64-bit proxy does the refresh there instead.
+	updateDriverSettings() cannot do this - read straight from NVDA's
+	settingsDialogs bytecode: _makeStringSettingControl builds the item list
+	ONCE and stores the VoiceInfo list on the panel as ``_voices``;
+	_updateValueForControl only ever calls SetSelection. Worse, the EVT_CHOICE
+	handler (StringDriverSettingChanger) maps the click through
+	``panel._voices[GetSelection()]`` - so with a stale list the user picks
+	what LOOKS like a Hungarian voice, the handler resolves it to an English
+	VoiceInfo, and the language snaps right back. All three must be replaced
+	by hand: ``panel._voices``, the combo items, and the selection.
+
+	Runs only where wx exists - in NVDA's own process. Inside the 32-bit
+	bridge host the import fails and this is a no-op; the 64-bit proxy does
+	the refresh there instead.
 	"""
 	try:
 		import wx
@@ -94,12 +102,25 @@ def _scheduleVoiceSettingsRefresh() -> None:
 				if not isinstance(win, settingsDialogs.NVDASettingsDialog):
 					continue
 				for panel in win.catIdToInstanceMap.values():
-					if isinstance(panel, settingsDialogs.VoiceSettingsPanel):
-						try:
-							panel.updateDriverSettings(changedSetting="language")
-						except Exception:
-							log.debugWarning("FlexVoice: updateDriverSettings failed", exc_info=True)
+					if not isinstance(panel, settingsDialogs.VoiceSettingsPanel):
+						continue
+					combo = getattr(panel, "voiceList", None)
+					if combo is None:
 						break
+					try:
+						driver = panel.getSettings()
+						infos = list(driver.availableVoices.values())
+						panel._voices = infos
+						combo.SetItems([v.displayName for v in infos])
+						ids = [v.id for v in infos]
+						cur = driver.voice
+						if cur in ids:
+							combo.SetSelection(ids.index(cur))
+						elif infos:
+							combo.SetSelection(0)
+					except Exception:
+						log.debugWarning("FlexVoice: voice combo rebuild failed", exc_info=True)
+					break
 				break
 		except Exception:
 			log.debugWarning("FlexVoice: settings panel refresh failed", exc_info=True)
