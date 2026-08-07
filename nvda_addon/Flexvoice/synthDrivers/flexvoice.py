@@ -1443,7 +1443,14 @@ if ctypes.sizeof(ctypes.c_void_p) == 8 and _Proxy32 is not None:
 			except Exception:
 				log.error("FlexVoice: could not set language on host", exc_info=True)
 				return
-			self._cachedLanguage = value
+			# Read back rather than assuming the set took. The remote setter
+			# ignores a language it has no data for, and that refusal does not
+			# raise across the bridge, so caching `value` blind would report a
+			# language the host is not actually speaking.
+			try:
+				self._cachedLanguage = self._remoteService.getParam("language")
+			except Exception:
+				self._cachedLanguage = None
 			# The host rebuilt its voice list for the new language, so every
 			# cached property on this side is stale - availableVoices above all.
 			# invalidateCache() is AutoPropertyObject's own API; clearing named

@@ -10,8 +10,9 @@ Fourteen voices in total:
 | English (US) | Tom, Julie, Ben, Leslie, Tim, Kim + four 8 kHz "Phone" variants |
 | Hungarian | Zita, Péter + two "Phone" variants |
 
-Tested on NVDA 2026.1 (64-bit, through NVDA's built-in 32-bit bridge) and on
-32-bit NVDA back to 2024.4.
+Tested on NVDA 2026.1 (64-bit, through NVDA's built-in 32-bit bridge). It should
+also work on 32-bit NVDA from 2024.4 onwards, where the driver runs in-process
+and needs no bridge — but that has not been tested, so reports are welcome.
 
 ## Why this was possible
 
@@ -85,7 +86,9 @@ váltani közöttük.
 | Magyar | Zita, Péter + két „Phone" változat |
 
 Kipróbálva NVDA 2026.1 alatt (64 bites, az NVDA beépített 32 bites hídján
-keresztül) és 32 bites NVDA-n 2024.4-ig visszamenőleg.
+keresztül). Elvben a 2024.4-től kezdődő 32 bites NVDA-kon is működik, ahol a
+meghajtó híd nélkül, közvetlenül fut — ez azonban nincs kipróbálva, így a
+visszajelzéseket szívesen fogadjuk.
 
 ## Miért most
 
