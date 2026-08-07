@@ -60,6 +60,20 @@ why the two sound so alike.)
 
 ## Fixes
 
+- Three crashes of the engine's *fragment* path — the submission mode the
+  wrapper must use so NVDA's index bookmarks work — were found and worked
+  around for Hungarian: raw digits (an access violation), ALL-CAPS runs and
+  intra-word hyphens (`e-mail`, `NVDA-val` — rendered as silence). Digits are
+  expanded to Hungarian number words in the wrapper (`123` →
+  *százhuszonhárom*), capitals are lowercased (the engine reads them
+  identically), and intra-word hyphens become spaces, which is how the engine's
+  own normalizer reads them anyway.
+- `DONE` could reach the reader before the first audio chunk, so an utterance
+  that started slowly — right after a language switch, or with the host under
+  load — was dropped as silence: the "skipping CD" bug. `DONE` is now held
+  until audio has actually been queued.
+- Switching language now refreshes the voice list in an open settings dialog;
+  previously it kept offering the old language's voices.
 - The 32-bit host returned on the first `DONE`, but the wrapper emits `DONE`
   before the engine's audio arrives — utterances could be truncated to silence.
 - A missing `_ipc.py` removed the whole synthesizer from NVDA's list instead of
@@ -133,6 +147,19 @@ más hangszínszabályzóval. Ha évek óta Tim a megszokott hang, az változatl
 
 ## Javítások
 
+- A motor *fragment*-útvonalának három összeomlása — ezt a beviteli módot kell
+  használnunk, hogy az NVDA indexkönyvjelzői működjenek — vált ismertté és
+  került megkerülésre a magyarnál: a nyers számjegyek (memóriahiba), a csupa
+  nagybetűs sorok és a szóközi kötőjelek (`e-mail`, `NVDA-val` — némaságként
+  szólaltak meg). A számjegyeket a csomagoló magyar számnevekké alakítja
+  (`123` → *százhuszonhárom*), a nagybetűket kisbetűsíti (a motor azonosan
+  olvassa őket), a szón belüli kötőjelből pedig szóköz lesz — a motor saját
+  normalizálója is így olvasná.
+- A `DONE` a hang első csomagja előtt érhetett az olvasóhoz, így a lassan
+  induló mondat — nyelvváltás után, vagy terhelt gazdafolyamatnál — némaságként
+  veszett el: az „ugráló CD" hiba. A `DONE` mostantól megvárja a hangot.
+- A nyelvváltás frissíti a nyitott beállítópanel hanglistáját; korábban a
+  régi nyelv hangjait kínálta tovább.
 - A 32 bites gazdafolyamat az első `DONE` jelre visszatért, a csomagoló viszont
   a hang megérkezése *előtt* küldi a `DONE`-t — a mondatok némaságra
   csonkulhattak.

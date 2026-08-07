@@ -48,6 +48,45 @@ try:
 except Exception:
 	LanguageInfo = None
 
+
+def _scheduleVoiceSettingsRefresh() -> None:
+	"""
+	Rebuild the voice list in an open NVDA settings dialog after a language
+	switch. Without this the Voice combo keeps showing the previous language's
+	voices, and choosing one silently switches the language right back.
+
+	Pattern borrowed from TGSpeechBox's driver: find the open NVDASettingsDialog
+	and ask its VoiceSettingsPanel to re-read our settings. Runs only where wx
+	exists - in NVDA's own process. Inside the 32-bit bridge host the import
+	fails and this is a no-op; the 64-bit proxy does the refresh there instead.
+	"""
+	try:
+		import wx
+		from gui import settingsDialogs
+	except Exception:
+		return
+
+	def _do():
+		try:
+			for win in wx.GetTopLevelWindows():
+				if not isinstance(win, settingsDialogs.NVDASettingsDialog):
+					continue
+				for panel in win.catIdToInstanceMap.values():
+					if isinstance(panel, settingsDialogs.VoiceSettingsPanel):
+						try:
+							panel.updateDriverSettings(changedSetting="language")
+						except Exception:
+							log.debugWarning("FlexVoice: updateDriverSettings failed", exc_info=True)
+						break
+				break
+		except Exception:
+			log.debugWarning("FlexVoice: settings panel refresh failed", exc_info=True)
+
+	try:
+		wx.CallAfter(_do)
+	except Exception:
+		pass
+
 from speech.commands import IndexCommand
 
 try:
@@ -624,6 +663,10 @@ class SynthDriver(BaseSynthDriver):
 		self._needsRecreate = True
 		self.cancel()
 		self._cmdQ.put((_CMD_RECREATE, None))
+		# On 32-bit NVDA this driver runs in NVDA's own process, so the open
+		# settings dialog is ours to refresh. In the bridge host wx is absent
+		# and this no-ops; the 64-bit proxy handles the dialog there.
+		_scheduleVoiceSettingsRefresh()
 
 	def _get_voice(self):
 		return self._voice
@@ -1459,6 +1502,9 @@ if ctypes.sizeof(ctypes.c_void_p) == 8 and _Proxy32 is not None:
 				self.invalidateCache()
 			except Exception:
 				log.debugWarning("FlexVoice: invalidateCache failed", exc_info=True)
+			# And the open settings dialog still shows the old language's
+			# voices; invalidating our cache does not redraw its combo.
+			_scheduleVoiceSettingsRefresh()
 
 		def _get_availableLanguages(self):
 			# Computed locally rather than over the wire: the data folders are on

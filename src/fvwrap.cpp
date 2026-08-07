@@ -881,6 +881,28 @@ static const char* hungarianLetterName(char lc) {
 }
 
 static void appendHungarianWide(std::string& out, wchar_t w) {
+    // Lowercase first. The engine reads "eti" and "ETI" identically through
+    // speakRequest (byte-identical wave output), but through the fragment path
+    // an ALL-CAPS run renders to near-silence - the same fragment-path
+    // fragility as raw digits. Lowercasing costs nothing (Hungarian TTS takes
+    // sentence breaks from punctuation, not capitals) and keeps acronyms
+    // audible: "ETI-eloquence" -> "eti-eloquence", spoken as the engine's own
+    // normalizer would.
+    if (w >= L'A' && w <= L'Z') {
+        w = (wchar_t)(w + 32);
+    } else {
+        switch (w) {
+        case 0x00C1: case 0x00C9: case 0x00CD: case 0x00D3:
+        case 0x00D6: case 0x00DA: case 0x00DC:
+            w = (wchar_t)(w + 0x20);  // A' E' I' O' O: U' U: -> lowercase
+            break;
+        case 0x0150: w = 0x0151; break;  // O" -> o"
+        case 0x0170: w = 0x0171; break;  // U" -> u"
+        default:
+            break;
+        }
+    }
+
     // Same punctuation folding as the English path.
     switch (w) {
     case 0x00A0: // nbsp
@@ -931,16 +953,158 @@ static void appendHungarianWide(std::string& out, wchar_t w) {
     appendNormalizedWide(out, w);
 }
 
+// --- Hungarian number words (CP1250 escapes; see hungarianLetterName) ---
+//
+// Digits MUST be expanded before addFragment() for Hungarian too. The engine
+// normalizes digits perfectly when driven through speakRequest(text) - Say.exe
+// proves it - but through the addFragment()/speakRequest(count) path that this
+// wrapper must use for NVDA index bookmarks, a raw digit is an access
+// violation. That is the very crash the English normalizeFragileTokens()
+// comment warns about ("or digits will slip through and crash FlexVoice
+// again"); it is a property of the fragment path, not of the language.
+
+static const char* hungarianDigitWord(char d) {
+    switch (d) {
+    case '0': return "nulla";
+    case '1': return "egy";
+    case '2': return "kett\xF5";      // ketto"
+    case '3': return "h\xE1rom";      // harom
+    case '4': return "n\xE9gy";       // negy
+    case '5': return "\xF6t";         // ot
+    case '6': return "hat";
+    case '7': return "h\xE9t";        // het
+    case '8': return "nyolc";
+    case '9': return "kilenc";
+    }
+    return "";
+}
+
+// 1..9 as a multiplier prefix: 2 is "ket" (ketszaz, ketezer), not "ketto".
+static const char* hungarianUnitPrefix(unsigned int n) {
+    switch (n) {
+    case 1: return "egy";
+    case 2: return "k\xE9t";          // ket
+    case 3: return "h\xE1rom";
+    case 4: return "n\xE9gy";
+    case 5: return "\xF6t";
+    case 6: return "hat";
+    case 7: return "h\xE9t";
+    case 8: return "nyolc";
+    case 9: return "kilenc";
+    }
+    return "";
+}
+
+static std::string hungarianBelow100(unsigned int n) {
+    // 2 is "ketto" everywhere except the multiplier position ("huszonketto",
+    // but "ketszaz") - the multiplier case is hungarianUnitPrefix's job.
+    static const char* tensStem[10] = {
+        "", "", "husz", "harminc", "negyven", "\xF6tven",
+        "hatvan", "hetven", "nyolcvan", "kilencven"
+    };
+    if (n == 0) return "";
+    if (n < 10) {
+        return hungarianDigitWord((char)('0' + n));
+    }
+    if (n < 20) {
+        // 10 = tiz, 11..19 = tizen + unit
+        if (n == 10) return "t\xEDz";
+        return std::string("tizen") + hungarianDigitWord((char)('0' + (n - 10)));
+    }
+    unsigned int t = n / 10, u = n % 10;
+    if (t == 2) {
+        // 20 = husz, 21..29 = huszon + unit
+        if (u == 0) return "h\xFAsz";
+        return std::string("huszon") + hungarianDigitWord((char)('0' + u));
+    }
+    std::string out = tensStem[t];
+    if (u) out += hungarianDigitWord((char)('0' + u));
+    return out;
+}
+
+static std::string hungarianBelow1000(unsigned int n) {
+    std::string out;
+    unsigned int h = n / 100, r = n % 100;
+    if (h) {
+        if (h > 1) out += hungarianUnitPrefix(h);
+        out += "sz\xE1z";             // szaz
+    }
+    out += hungarianBelow100(r);
+    return out;
+}
+
+static std::string hungarianNumberToWords(unsigned long long n) {
+    if (n == 0) return "nulla";
+    struct Scale { unsigned long long value; const char* name; };
+    static const Scale scales[] = {
+        { 1000000000ull, "milli\xE1rd" },   // milliard
+        { 1000000ull,    "milli\xF3" },     // millio
+        { 1000ull,       "ezer" },
+    };
+    std::string out;
+    for (const Scale& s : scales) {
+        if (n < s.value) continue;
+        unsigned long long g = n / s.value;
+        n %= s.value;
+        // "ezer" alone for 1000 (not "egyezer"); otherwise group + scale.
+        if (!(g == 1 && s.value == 1000ull)) {
+            if (g < 10) out += hungarianUnitPrefix((unsigned int)g);
+            else out += hungarianBelow1000((unsigned int)g);
+        }
+        out += s.name;
+        if (n) out += " ";            // "ketezer huszonhat" - spoken boundary
+    }
+    if (n) out += hungarianBelow1000((unsigned int)n);
+    return out;
+}
+
+// Replace every digit run in CP1250 text with Hungarian number words.
+// Runs with a leading zero or longer than 9 digits are spelled digit by digit
+// ("007" -> "nulla nulla het"), mirroring the English normalizer's policy.
+static std::string hungarianExpandDigits(const std::string& in) {
+    std::string out;
+    out.reserve(in.size() + 16);
+    size_t i = 0;
+    while (i < in.size()) {
+        if (!isAsciiDigit(in[i])) {
+            out.push_back(in[i]);
+            i++;
+            continue;
+        }
+        size_t j = i;
+        while (j < in.size() && isAsciiDigit(in[j])) j++;
+        const std::string digits = in.substr(i, j - i);
+
+        std::string words;
+        if (digits.size() > 9 || (digits.size() > 1 && digits[0] == '0')) {
+            for (size_t k = 0; k < digits.size(); k++) {
+                if (k) words += " ";
+                words += hungarianDigitWord(digits[k]);
+            }
+        } else {
+            unsigned long long v = 0;
+            for (char c : digits) v = v * 10ull + (unsigned long long)(c - '0');
+            words = hungarianNumberToWords(v);
+        }
+
+        // Keep word boundaries audible around the expansion.
+        if (!out.empty() && isAsciiAlnum(out.back())) out.push_back(' ');
+        out += words;
+        if (j < in.size() && isAsciiAlnum(in[j])) out.push_back(' ');
+        i = j;
+    }
+    return out;
+}
+
 // UTF-8 -> CP1250 for the Hungarian engine.
 //
 // Deliberately does NOT call normalizeFragileTokens(): that is English text
-// normalization (number words, acronym spelling, letter names) and the
-// Hungarian engine already does all of it natively, and better --
-//   "123"                -> "szazhuszonharom"
-//   "2026. augusztus 6." -> "ketezer-huszonhat augusztus hatodika"
-//   "12.5%"              -> "tizenketto egesz ot tized szazalek"
-// Running the English expansion first would turn "123" into "one two three"
-// spoken with Hungarian phonemes.
+// normalization (acronym spelling, letter names, English number words) and
+// running it here is what made Zita read "1" as "one". Digits are expanded to
+// Hungarian words above instead, because the fragment path cannot take them
+// raw (see hungarianDigitWord). The rest - dates, percent, ordinals - reads
+// as plain numbers; the engine's own richer expansion ("hatodika") is only
+// reachable through speakRequest(text), which cannot carry NVDA's bookmarks.
 static std::string utf8ToHungarianBytes(const char* sUtf8) {
     if (!sUtf8) return std::string();
 
@@ -957,6 +1121,24 @@ static std::string utf8ToHungarianBytes(const char* sUtf8) {
         wchar_t w = ws[i];
         if (w == 0) break;
         appendHungarianWide(out, w);
+    }
+
+    out = hungarianExpandDigits(out);
+
+    // Intra-word hyphens are another fragment-path killer: "e-mail",
+    // "szoba-konyha" and "eti-eloquence" all render to 2 bytes of silence,
+    // while "ha - akkor" (spaced) is fine. The native normalizer reads a
+    // hyphenated compound like its parts, so a space is the same audible
+    // result without the crash. Hungarian leans on these (e-mail, NVDA-val,
+    // ketezer-huszonhat), so this is not an edge case. Accented letters live
+    // at >= 0x80 in CP1250 and count as word characters here.
+    for (size_t i = 0; i < out.size(); i++) {
+        if (out[i] != '-') continue;
+        const bool prevWord = i > 0 &&
+            (isAsciiAlnum(out[i - 1]) || (unsigned char)out[i - 1] >= 0x80);
+        const bool nextWord = i + 1 < out.size() &&
+            (isAsciiAlnum(out[i + 1]) || (unsigned char)out[i + 1] >= 0x80);
+        if (prevWord || nextWord) out[i] = ' ';
     }
 
     // Character echo: the engine renders a lone consonant as a bare phoneme
@@ -1133,6 +1315,12 @@ public:
         std::lock_guard<std::mutex> g(_mtx);
         if (_activeGen.load(std::memory_order_relaxed) != gen) return;
         _q.push_back(StreamItem(FVWRAP_ITEM_ERROR, err, gen));
+    }
+
+    // Whether any audio has been enqueued for this generation. Used by the
+    // worker to keep DONE from overtaking the first audio chunk.
+    bool sawAudio(uint32_t gen) const {
+        return _audioSeenGen.load(std::memory_order_relaxed) == gen;
     }
 
     void finishRequest(uint32_t gen) {
@@ -1321,11 +1509,13 @@ private:
 
         _queuedAudioBytes += it.data.size();
         _q.push_back(std::move(it));
+        _audioSeenGen.store(gen, std::memory_order_relaxed);
     }
 
 private:
     WaveOutputFormat _fmt;
     std::atomic<uint32_t> _activeGen{ 0 };
+    std::atomic<uint32_t> _audioSeenGen{ 0 };
 
     std::mutex _mtx;
     std::condition_variable _cvNotFull;
@@ -1611,7 +1801,18 @@ static void workerLoop(WrapState* st) {
                 if (!p.text.empty()) {
                     Prepared pr;
                     pr.isIndex = false;
-                    pr.text = normalizeFragileTokens(p.text); // KEEP ALL NORMALIZER RULES
+                    // English text was normalized once in fvwrap_addTextUtf8 and is
+                    // normalized again here at speak time. KEEP ALL NORMALIZER RULES
+                    // for English.
+                    //
+                    // Hungarian must NOT pass through here: this is English text
+                    // normalization, and it undid the Hungarian path's work at the
+                    // last moment - a "1" that correctly survived addTextUtf8
+                    // untouched was expanded to "one" right before synthesis, so
+                    // Zita read English number words with Hungarian phonemes.
+                    pr.text = (st->lang == LNG_HUNGARIAN)
+                        ? p.text
+                        : normalizeFragileTokens(p.text);
                     if (!pr.text.empty()) {
                         prepared.push_back(std::move(pr));
                     }
@@ -1665,6 +1866,32 @@ static void workerLoop(WrapState* st) {
             st->output->gateOff();
             st->output->clearQueue();
             continue;
+        }
+
+        // Engine::wait() is documented to block until the request is processed,
+        // but the audio put() callbacks were observed trailing it by ~10ms -
+        // DONE reached the reader 2ms after commit with the first audio at 12ms.
+        // Readers treat DONE plus a short quiet window as end-of-utterance, so
+        // when the engine started slowly (right after a recreate, or with the
+        // host under load) the whole utterance was dropped as silence: the
+        // "skipping CD" bug. Hold DONE until the first audio chunk has actually
+        // been enqueued, with a grace timeout for text the engine legitimately
+        // renders to nothing.
+        {
+            const int graceMs = 500;
+            for (int waited = 0; waited < graceMs; waited += 5) {
+                if (st->output->sawAudio(gen)) break;
+                if (st->cancelToken.load(std::memory_order_relaxed) != cmd.cancelSnapshot) {
+                    canceled = true;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            if (canceled) {
+                st->output->gateOff();
+                st->output->clearQueue();
+                continue;
+            }
         }
 
         st->output->finishRequest(gen);
