@@ -1840,6 +1840,30 @@ static void workerLoop(WrapState* st) {
         std::vector<Prepared> prepared;
         prepared.reserve(cmd.parts.size());
 
+        // Hungarian: turn the engine's foreign-word detector off for this
+        // utterance.
+        //
+        // The Hungarian data ships langdet_eng.dat and langdet_ger.dat, and the
+        // engine uses them to spot English and German words and pronounce them
+        // in that language - "set" reads as Hungarian /Set/, but "settings" is
+        // detected as English and comes out /s e t i N z/. Through the fragment
+        // path that foreign branch is broken: "stop" ran 60% long and correlated
+        // 0.55 against the same text spoken natively, "desktop" 0.57, which is
+        // the letter-swapping people hear ("dekeiop"). Hungarian words are
+        // unaffected, and appending any vowel ("stopa") makes it behave - it is
+        // the detector firing, not the phonetics.
+        //
+        // The data files cannot simply be dropped: without them the engine
+        // fails to create at all. But it accepts embedded commands, in the
+        // backslash syntax used by the SDK's own Say sample (\rspd=1.0\ ), and
+        // \langdet=0\ disables detection. Measured after: stop 0.999, desktop
+        // 1.000, top 1.000, Hungarian words unchanged, and the command itself
+        // is consumed rather than spoken.
+        //
+        // Foreign words then get Hungarian letter-to-sound, which is what a
+        // Hungarian screen-reader user expects anyway ("desktop" as "deszktop").
+        bool needLangDetOff = (st->lang == LNG_HUNGARIAN);
+
         for (const auto& p : cmd.parts) {
             if (st->cancelToken.load(std::memory_order_relaxed) != cmd.cancelSnapshot) {
                 canceled = true;
@@ -1862,6 +1886,10 @@ static void workerLoop(WrapState* st) {
                     pr.text = (st->lang == LNG_HUNGARIAN)
                         ? p.text
                         : normalizeFragileTokens(p.text);
+                    if (!pr.text.empty() && needLangDetOff) {
+                        pr.text.insert(0, "\\langdet=0\\ ");
+                        needLangDetOff = false;
+                    }
                     if (!pr.text.empty()) {
                         prepared.push_back(std::move(pr));
                     }
