@@ -49,6 +49,28 @@ except Exception:
 	LanguageInfo = None
 
 
+def _dropVoiceListCaches(synth) -> None:
+	"""
+	Make the next availableVoices read hit the driver again.
+
+	SynthDriver._get_availableVoices caches its result in the instance
+	attribute ``_availableVoices`` (``_availableVariants`` for variants) -
+	verified in NVDA's own synthDriverHandler. AutoPropertyObject's
+	invalidateCache() does NOT clear these, so after a language switch the old
+	language's voices kept being served: the GUI listed Hungarian voices with
+	English selected, one language behind, while the host itself was correct.
+	"""
+	for attr in ("_availableVoices", "_availableVariants"):
+		try:
+			delattr(synth, attr)
+		except AttributeError:
+			pass
+	try:
+		synth.invalidateCache()
+	except Exception:
+		pass
+
+
 def _scheduleVoiceSettingsRefresh() -> None:
 	"""
 	Rebuild the voice list in an open NVDA settings dialog after a language
@@ -663,6 +685,7 @@ class SynthDriver(BaseSynthDriver):
 		self._needsRecreate = True
 		self.cancel()
 		self._cmdQ.put((_CMD_RECREATE, None))
+		_dropVoiceListCaches(self)
 		# On 32-bit NVDA this driver runs in NVDA's own process, so the open
 		# settings dialog is ours to refresh. In the bridge host wx is absent
 		# and this no-ops; the 64-bit proxy handles the dialog there.
@@ -689,6 +712,8 @@ class SynthDriver(BaseSynthDriver):
 					self._needsRecreate = True
 					self.cancel()
 					self._cmdQ.put((_CMD_RECREATE, None))
+					_dropVoiceListCaches(self)
+					_scheduleVoiceSettingsRefresh()
 					return
 			log.warning(f"FlexVoice: unknown voice {val!r}, ignoring")
 			return
@@ -1494,17 +1519,29 @@ if ctypes.sizeof(ctypes.c_void_p) == 8 and _Proxy32 is not None:
 				self._cachedLanguage = self._remoteService.getParam("language")
 			except Exception:
 				self._cachedLanguage = None
-			# The host rebuilt its voice list for the new language, so every
-			# cached property on this side is stale - availableVoices above all.
-			# invalidateCache() is AutoPropertyObject's own API; clearing named
-			# private attributes would depend on proxy internals.
-			try:
-				self.invalidateCache()
-			except Exception:
-				log.debugWarning("FlexVoice: invalidateCache failed", exc_info=True)
+			# The host rebuilt its voice list for the new language. The proxy
+			# inherits SynthDriver's _get_availableVoices, which caches in the
+			# _availableVoices instance attribute - drop it, or this side keeps
+			# serving the previous language's list no matter what the host says.
+			_dropVoiceListCaches(self)
 			# And the open settings dialog still shows the old language's
-			# voices; invalidating our cache does not redraw its combo.
+			# voices; dropping our cache does not redraw its combo.
 			_scheduleVoiceSettingsRefresh()
+
+		def _set_voice(self, value):
+			# The host treats picking a voice from the other language as a
+			# language switch (config restore from an older build, mostly).
+			# When that happens this side's language and voice-list caches
+			# must follow, or they end up one language behind again.
+			super()._set_voice(value)
+			try:
+				remoteLang = self._remoteService.getParam("language")
+			except Exception:
+				return
+			if remoteLang != self._cachedLanguage:
+				self._cachedLanguage = remoteLang
+				_dropVoiceListCaches(self)
+				_scheduleVoiceSettingsRefresh()
 
 		def _get_availableLanguages(self):
 			# Computed locally rather than over the wire: the data folders are on
