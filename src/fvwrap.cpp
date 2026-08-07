@@ -835,6 +835,150 @@ static std::string normalizeFragileTokens(const std::string& in) {
     return out;
 }
 
+// ============================================================
+// Hungarian text path
+// ============================================================
+//
+// The English path folds every accent down to ASCII, which is fine for
+// "Beyonce" but destroys Hungarian: vowel length and umlauts are phonemic, so
+// "Arvizturo" and "Árvíztűrő" are different words to the engine. Verified with
+// Say.exe -lang hun -phout:
+//
+//   ASCII  "Arvizturo"  -> a r . v i s . t u . r o      (all short, wrong)
+//   CP1250 "Árvíztűrő"  -> A: r . v i: s . t U: . r O:  (correct)
+//
+// CP1250 and ISO-8859-2 encode every Hungarian letter at the same code point,
+// so either satisfies the engine; CP1250 is used because Windows has it built in.
+
+// Hungarian letter names, already in CP1250 bytes (written as escapes so the
+// encoding of this source file cannot corrupt them).
+static const char* hungarianLetterName(char lc) {
+    switch (lc) {
+    case 'b': return "b\xE9";          // be
+    case 'c': return "c\xE9";          // ce
+    case 'd': return "d\xE9";          // de
+    case 'f': return "ef";
+    case 'g': return "g\xE9";          // ge
+    case 'h': return "h\xE1";          // ha
+    case 'j': return "j\xE9";          // je
+    case 'k': return "k\xE1";          // ka
+    case 'l': return "el";
+    case 'm': return "em";
+    case 'n': return "en";
+    case 'p': return "p\xE9";          // pe
+    case 'q': return "k\xFA";          // ku
+    case 'r': return "er";
+    case 's': return "es";
+    case 't': return "t\xE9";          // te
+    case 'v': return "v\xE9";          // ve
+    case 'w': return "dupla v\xE9";    // dupla ve
+    case 'x': return "iksz";
+    case 'y': return "ipszilon";
+    case 'z': return "z\xE9";          // ze
+    // Vowels are their own names in Hungarian - leave them alone.
+    default:  return nullptr;
+    }
+}
+
+static void appendHungarianWide(std::string& out, wchar_t w) {
+    // Same punctuation folding as the English path.
+    switch (w) {
+    case 0x00A0: // nbsp
+    case 0x200B:
+    case 0x200C:
+    case 0x200D:
+        out.push_back(' ');
+        return;
+    case 0x2018:
+    case 0x2019:
+        out.push_back('\'');
+        return;
+    case 0x201C:
+    case 0x201D:
+        out.push_back('"');
+        return;
+    case 0x2013:
+    case 0x2014:
+        out.push_back('-');
+        return;
+    case 0x2026:
+        out.append("...");
+        return;
+    default:
+        break;
+    }
+
+    if (w >= 0 && w <= 0x7F) {
+        unsigned char uc = (unsigned char)w;
+        char c = (char)uc;
+        if (uc < 0x20 && c != '\r' && c != '\n' && c != '\t') c = ' ';
+        else if (uc == 0x7F) c = ' ';
+        out.push_back(c);
+        return;
+    }
+
+    char buf[8];
+    BOOL usedDefault = FALSE;
+    int n = WideCharToMultiByte(1250, 0, &w, 1, buf, (int)sizeof(buf), nullptr, &usedDefault);
+    if (n > 0 && !usedDefault) {
+        out.append(buf, (size_t)n);
+        return;
+    }
+
+    // Not representable in CP1250 (Cyrillic, CJK, emoji, ...). Fall back to the
+    // ASCII approximation rather than '?' - a literal '?' is what broke the
+    // Latin-1 probe run, turning "turo" into "t _ _ _".
+    appendNormalizedWide(out, w);
+}
+
+// UTF-8 -> CP1250 for the Hungarian engine.
+//
+// Deliberately does NOT call normalizeFragileTokens(): that is English text
+// normalization (number words, acronym spelling, letter names) and the
+// Hungarian engine already does all of it natively, and better --
+//   "123"                -> "szazhuszonharom"
+//   "2026. augusztus 6." -> "ketezer-huszonhat augusztus hatodika"
+//   "12.5%"              -> "tizenketto egesz ot tized szazalek"
+// Running the English expansion first would turn "123" into "one two three"
+// spoken with Hungarian phonemes.
+static std::string utf8ToHungarianBytes(const char* sUtf8) {
+    if (!sUtf8) return std::string();
+
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, sUtf8, -1, nullptr, 0);
+    if (wlen <= 0) return std::string();
+
+    std::wstring ws;
+    ws.resize((size_t)wlen);
+    MultiByteToWideChar(CP_UTF8, 0, sUtf8, -1, &ws[0], wlen);
+
+    std::string out;
+    out.reserve((size_t)wlen + 8);
+    for (size_t i = 0; i < ws.size(); i++) {
+        wchar_t w = ws[i];
+        if (w == 0) break;
+        appendHungarianWide(out, w);
+    }
+
+    // Character echo: the engine renders a lone consonant as a bare phoneme
+    // ("k" -> /k/), which is almost inaudible when reviewing text by character.
+    // Speak the Hungarian letter name instead. Single letters only, so ordinary
+    // words are untouched.
+    {
+        size_t b = 0, e = out.size();
+        while (b < e && isSpaceLike(out[b])) b++;
+        while (e > b && isSpaceLike(out[e - 1])) e--;
+        if (e - b == 1) {
+            char c = out[b];
+            if (isAsciiAlpha(c)) {
+                const char* nm = hungarianLetterName(toLowerAscii(c));
+                if (nm) return std::string(nm);
+            }
+        }
+    }
+
+    return out;
+}
+
 // UTF-8 -> ISO-8859-1 safe-ish conversion + control sanitization + fragile-token normalization
 static std::string utf8ToLatin1Safe(const char* sUtf8) {
     if (!sUtf8) return std::string();
@@ -1670,8 +1814,13 @@ FVWRAP_API void __cdecl fvwrap_addTextUtf8(FVWRAP_HANDLE h, const char* textUtf8
     auto st = asState(h);
     if (!st || !textUtf8) return;
 
-    // Converts + sanitizes + expands digits + expands single consonants + spells short ALL-CAPS tokens.
-    std::string s = utf8ToLatin1Safe(textUtf8);
+    // English: converts + sanitizes + expands digits + expands single consonants
+    //          + spells short ALL-CAPS tokens.
+    // Hungarian: converts to CP1250 keeping the accents, and leaves normalization
+    //          to the engine, which does it natively (see utf8ToHungarianBytes).
+    std::string s = (st->lang == LNG_HUNGARIAN)
+        ? utf8ToHungarianBytes(textUtf8)
+        : utf8ToLatin1Safe(textUtf8);
     if (s.empty()) return;
 
     std::lock_guard<std::mutex> g(st->buildMtx);

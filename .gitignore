@@ -1,0 +1,30 @@
+# Build output
+build_x86/
+build/
+dist/
+*.obj
+*.exp
+*.ilk
+*.pdb
+__pycache__/
+*.pyc
+
+# Packaged add-on (published as a release asset, not tracked)
+*.nvda-addon
+
+# Mindmaker voice data and engine binaries.
+# These are Mindmaker/FlexVoice property, redistributed only with permission;
+# they are staged into nvda_addon/Flexvoice/synthDrivers/ at package time.
+nvda_addon/Flexvoice/synthDrivers/English/
+nvda_addon/Flexvoice/synthDrivers/Hungarian/
+nvda_addon/Flexvoice/synthDrivers/*.dll
+vendor/flexvoice_sdk/
+
+# Stale PyInstaller build of the legacy 32-bit host. Unreachable now (NVDA was
+# 32-bit through 2025.3, so the driver runs in-process there; 2026.1 is the
+# first 64-bit release and ships the bridge), and it cannot be rebuilt without
+# PyInstaller, so keeping a 7 MB binary in history buys nothing.
+nvda_addon/Flexvoice/synthDrivers/flexvoice_host32.exe
+
+# Scratch
+nvda.log

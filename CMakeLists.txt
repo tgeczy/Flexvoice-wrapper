@@ -8,6 +8,9 @@ add_library(fvwrap SHARED
 target_include_directories(fvwrap PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${CMAKE_CURRENT_SOURCE_DIR}/vendor/flexvoice_sdk/include
+  # fvwrap.cpp includes the engine headers flat ("Engine.h", "FVLanguage.h", ...),
+  # so the ttsapi folder itself has to be on the include path.
+  ${CMAKE_CURRENT_SOURCE_DIR}/vendor/flexvoice_sdk/include/ttsapi
 )
 
 target_compile_definitions(fvwrap PRIVATE
