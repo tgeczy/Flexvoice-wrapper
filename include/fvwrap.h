@@ -42,6 +42,15 @@ FVWRAP_API int __cdecl fvwrap_setRatePercent(FVWRAP_HANDLE h, int ratePercent);
 FVWRAP_API int __cdecl fvwrap_setVolumePercent(FVWRAP_HANDLE h, int volPercent);
 FVWRAP_API int __cdecl fvwrap_setPitchPercent(FVWRAP_HANDLE h, int pitchPercent);
 
+// Brightness / high-frequency emphasis, 0..100, 50 = the voice as authored.
+// Tilts the speaker's equalizer: nothing below ~1kHz moves, the boost ramps in
+// logarithmically above it and reaches +/-8 dB by ~6kHz. Suggested by FlexVoice's
+// own author - the filter was designed at Mindmaker but never given a control.
+FVWRAP_API int __cdecl fvwrap_setClarityPercent(FVWRAP_HANDLE h, int clarityPercent);
+
+// 1 if the loaded voice actually has an equalizer to tilt, 0 otherwise.
+FVWRAP_API int __cdecl fvwrap_hasClarity(FVWRAP_HANDLE h);
+
 // Build one utterance (text + index boundaries), then commit.
 // The wrapper will internally inject BM_USER bookmarks for indexes.
 FVWRAP_API void __cdecl fvwrap_begin(FVWRAP_HANDLE h);

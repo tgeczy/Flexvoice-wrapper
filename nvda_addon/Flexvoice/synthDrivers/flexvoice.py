@@ -488,6 +488,10 @@ class SynthDriver(BaseSynthDriver):
 			NumericDriverSetting("rate", "&Rate", defaultVal=50, availableInSettingsRing=True),
 			NumericDriverSetting("pitch", "&Pitch", defaultVal=50, availableInSettingsRing=True),
 			NumericDriverSetting("volume", "&Volume", defaultVal=100, availableInSettingsRing=True),
+			# Suggested by FlexVoice's author: the voices sound more natural
+			# with the high frequencies lifted. 50 is the voice exactly as it
+			# was authored, so nobody's voice changes until they ask.
+			NumericDriverSetting("clarity", "&Clarity", defaultVal=50, availableInSettingsRing=True),
 		)
 	else:
 		# Fallback for older NVDA: classic supported settings.
@@ -541,12 +545,15 @@ class SynthDriver(BaseSynthDriver):
 		self._rate = 50
 		self._volume = 100
 		self._pitch = 50
+		self._clarity = 50
 
 		# Track applied settings to avoid churn
 		self._appliedRate = None
 		self._appliedVol = None
 		self._appliedPitch = None
+		self._appliedClarity = None
 		self._hasPitch = False
+		self._hasClarity = False
 
 		# 3) Runtime handles / audio format
 		self._sr = 16000
@@ -759,6 +766,12 @@ class SynthDriver(BaseSynthDriver):
 	def _set_pitch(self, val):
 		self._pitch = _clampPercent(val)
 
+	def _get_clarity(self):
+		return int(self._clarity)
+
+	def _set_clarity(self, val):
+		self._clarity = _clampPercent(val)
+
 	# ---------------- Internals ----------------
 	def _speakerPathForVoice(self, voiceName: str) -> str:
 		p = self._voiceMap.get(voiceName)
@@ -811,10 +824,12 @@ class SynthDriver(BaseSynthDriver):
 						self._bits = bits
 						self._channels = 1
 						self._hasPitch = self._engine.has_pitch
+						self._hasClarity = getattr(self._engine, "has_clarity", False)
 
 						self._appliedRate = None
 						self._appliedVol = None
 						self._appliedPitch = None
+						self._appliedClarity = None
 
 						log.info(f"FlexVoice: created engine ({label}, {sr}Hz)")
 						return
@@ -984,6 +999,7 @@ class SynthDriver(BaseSynthDriver):
 		rate = _clampPercent(self._rate)
 		vol = _clampPercent(self._volume)
 		pit = _clampPercent(self._pitch)
+		clr = _clampPercent(self._clarity)
 
 		if self._appliedRate != rate:
 			try:
@@ -1003,6 +1019,13 @@ class SynthDriver(BaseSynthDriver):
 			try:
 				self._engine.set_pitch_percent(int(pit))
 				self._appliedPitch = pit
+			except Exception:
+				pass
+
+		if self._hasClarity and self._appliedClarity != clr:
+			try:
+				self._engine.set_clarity_percent(int(clr))
+				self._appliedClarity = clr
 			except Exception:
 				pass
 
@@ -1555,6 +1578,19 @@ if ctypes.sizeof(ctypes.c_void_p) == 8 and _Proxy32 is not None:
 				self._cachedLanguage = self._remoteService.getParam("language")
 			except Exception:
 				self._cachedLanguage = None
+
+		# Clarity is ours too, so the bridge does not forward it either.
+		def _get_clarity(self):
+			try:
+				return int(self._remoteService.getParam("clarity"))
+			except Exception:
+				return 50
+
+		def _set_clarity(self, value):
+			try:
+				self._remoteService.setParam("clarity", int(value))
+			except Exception:
+				log.debugWarning("FlexVoice: could not set clarity on host", exc_info=True)
 
 		def _get_availableLanguages(self):
 			# Computed locally rather than over the wire: the data folders are on

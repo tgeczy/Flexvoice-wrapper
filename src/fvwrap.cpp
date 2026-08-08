@@ -1610,15 +1610,22 @@ struct WrapState {
     std::atomic<uint32_t> cancelToken{ 1 };
     std::atomic<uint32_t> genCounter{ 1 };
 
+    // The voice's authored equalizer gains, captured once at create time so a
+    // clarity change is always computed from the original curve rather than
+    // from the previous adjustment.
+    std::vector<double> baseEqGains;
+
     // Settings (store-only)
     std::atomic<int> desiredRate{ 50 };
     std::atomic<int> desiredVol{ 100 };
     std::atomic<int> desiredPitch{ 50 };
+    std::atomic<int> desiredClarity{ 50 };
 
     // Applied caches (worker thread only)
     int appliedRate = -1;
     int appliedVol = -1;
     int appliedPitch = -1;
+    int appliedClarity = -1;
 
     std::mutex buildMtx;
     std::string buildText;
@@ -1655,13 +1662,96 @@ static bool tryGetSpeakerInt(const Speaker& sp, const char* name, int& v) {
     try { return sp.get(name, v); } catch (...) { return false; }
 }
 
-static bool applyPitchToSpeakerLocked(WrapState* st, int pitchPercent) {
+// Tilt a speaker's equalizer to brighten (or darken) the voice.
+//
+// Király József's own suggestion: FlexVoice sounds more natural with the high
+// frequencies lifted a little. Mindmaker designed the filter but never shipped
+// the control for it - and the mechanism really is there, sitting in the .tav:
+//
+//   obj:Equalizer equalizer[7]
+//     obj { 7750.000000; 1.714286; 3.000000; },   // { f0 Hz; bandwidth; gain dB }
+//
+// The engine honours it, and Speaker exposes it at runtime through the
+// attribute API (Speaker.h:66-110), so no data files have to be rewritten.
+//
+// The curve: nothing below ~1 kHz moves, so vowels and body are untouched;
+// above that the boost ramps in logarithmically and reaches its maximum by
+// ~6 kHz, where the consonant detail that carries intelligibility lives.
+// 50 means "exactly as the voice was authored", so no one's voice changes
+// until they ask.
+static void applyClarityToSpeaker(Speaker& sp, int clarityPercent,
+                                  const std::vector<double>& baseGains) {
+    clarityPercent = clampInt(clarityPercent, 0, 100);
+
+    IAttribute* eq = sp.getAttribute("equalizer");
+    if (!eq) return;
+
+    int channels = 0;
+    if (!eq->get("channels", channels) || channels <= 0) return;
+    if ((size_t)channels > baseGains.size()) channels = (int)baseGains.size();
+
+    // -1 .. +1, zero at the authored setting.
+    const double t = ((double)clarityPercent - 50.0) / 50.0;
+
+    const double PIVOT_HZ = 1000.0;   // below this, leave the voice alone
+    const double FULL_HZ  = 6000.0;   // by here the tilt is at full strength
+    const double MAX_DB   = 6.0;
+
+    // Work out the shelf shape first, then remove its average, so the curve
+    // TILTS rather than lifts. This matters more than it looks: the bands are
+    // very wide (bw 1.714 is octaves, not hertz), so a plain boost of the top
+    // two bands raises broadband energy and clips - measured 414 clipped
+    // samples at clarity 100 before this. Mean-centring keeps loudness roughly
+    // constant: highs come up, lows come down by the same average amount.
+    std::vector<double> shelf((size_t)channels, 0.0);
+    double sum = 0.0;
+    for (int i = 0; i < channels; i++) {
+        double f0 = 0.0;
+        if (!eq->get("f0", f0, i)) f0 = 0.0;
+        double s = 0.0;
+        if (f0 > PIVOT_HZ) {
+            // Logarithmic ramp: ears hear frequency in octaves, not hertz.
+            s = std::log(f0 / PIVOT_HZ) / std::log(FULL_HZ / PIVOT_HZ);
+            if (s > 1.0) s = 1.0;
+        }
+        shelf[(size_t)i] = s;
+        sum += s;
+    }
+    const double mean = sum / (double)channels;
+
+    // Even mean-centred, brightening lifts measured level by ~3.5 dB at full
+    // tilt, and some voices are authored nearly full-scale already (Tom peaks
+    // at 32679 of 32767 untouched), so it still clipped. Trade that back for
+    // headroom, which also makes the control timbre-only rather than a
+    // disguised volume knob.
+    //
+    // One-sided on purpose: darkening already lowers the level, so adding the
+    // same compensation there pushed the low end back into clipping (35
+    // clipped samples at clarity 0). Only brightening needs the headroom.
+    const double COMP_DB = 3.5;
+    const double comp = (t > 0.0) ? t * COMP_DB : 0.0;
+
+    for (int i = 0; i < channels; i++) {
+        // Always start from the authored gain so repeated adjustments cannot
+        // compound - the same reason pitch re-reads the base speaker.
+        const double gain = baseGains[(size_t)i]
+                          + t * MAX_DB * (shelf[(size_t)i] - mean)
+                          - comp;
+        eq->set("gain", gain, i);
+    }
+}
+
+static bool applySpeakerParamsLocked(WrapState* st, int pitchPercent, int clarityPercent) {
     if (!st || !st->engine) return false;
 
     pitchPercent = clampInt(pitchPercent, 0, 100);
 
     // Start from base speaker each time (prevents compounding).
+    // NOTE: pitch and clarity must share ONE copy and ONE setSpeaker call.
+    // Applying them separately would silently undo whichever ran first,
+    // because each starts from st->speaker again.
     Speaker sp = st->speaker;
+    applyClarityToSpeaker(sp, clarityPercent, st->baseEqGains);
 
     // Speaker.h gives us the correct names:
     // "defaultPitch" int, "pitchMin" int, "pitchMax" int
@@ -1770,11 +1860,13 @@ static void applyEngineParamsLocked(WrapState* st) {
         st->appliedVol = vp;
     }
 
-    // Pitch via speaker
+    // Pitch and clarity both live on the speaker, so one call applies both.
     const int pp = clampInt(st->desiredPitch.load(std::memory_order_relaxed), 0, 100);
-    if (st->appliedPitch != pp) {
-        (void)applyPitchToSpeakerLocked(st, pp);
+    const int cp = clampInt(st->desiredClarity.load(std::memory_order_relaxed), 0, 100);
+    if (st->appliedPitch != pp || st->appliedClarity != cp) {
+        (void)applySpeakerParamsLocked(st, pp, cp);
         st->appliedPitch = pp;
+        st->appliedClarity = cp;
     }
 }
 
@@ -2002,6 +2094,23 @@ FVWRAP_API FVWRAP_HANDLE __cdecl fvwrap_create(
             st->speaker.load(speakerTavPath);
         }
 
+        // Remember the voice's authored equalizer curve before anything touches
+        // it, so clarity is always applied relative to how the voice was built.
+        try {
+            IAttribute* eq = st->speaker.getAttribute("equalizer");
+            int channels = 0;
+            if (eq && eq->get("channels", channels) && channels > 0) {
+                st->baseEqGains.reserve((size_t)channels);
+                for (int i = 0; i < channels; i++) {
+                    double g = 0.0;
+                    if (!eq->get("gain", g, i)) g = 0.0;
+                    st->baseEqGains.push_back(g);
+                }
+            }
+        } catch (...) {
+            st->baseEqGains.clear();
+        }
+
         std::auto_ptr<Engine> eng = st->factory->createEngine(st->output, st->speaker, st->lang);
         st->engine = eng.release();
 
@@ -2104,6 +2213,21 @@ FVWRAP_API int __cdecl fvwrap_setPitchPercent(FVWRAP_HANDLE h, int pitchPercent)
     if (!st) return 1;
     st->desiredPitch.store(clampInt(pitchPercent, 0, 100), std::memory_order_relaxed);
     return 0;
+}
+
+FVWRAP_API int __cdecl fvwrap_setClarityPercent(FVWRAP_HANDLE h, int clarityPercent) {
+    auto st = asState(h);
+    if (!st) return 1;
+    st->desiredClarity.store(clampInt(clarityPercent, 0, 100), std::memory_order_relaxed);
+    return 0;
+}
+
+FVWRAP_API int __cdecl fvwrap_hasClarity(FVWRAP_HANDLE h) {
+    auto st = asState(h);
+    if (!st) return 0;
+    // A voice with no equalizer block cannot be brightened; the driver uses
+    // this to avoid offering a control that would do nothing.
+    return st->baseEqGains.empty() ? 0 : 1;
 }
 
 FVWRAP_API void __cdecl fvwrap_begin(FVWRAP_HANDLE h) {

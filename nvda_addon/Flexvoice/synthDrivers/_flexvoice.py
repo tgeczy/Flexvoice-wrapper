@@ -65,6 +65,10 @@ class DirectEngine:
 		self._dll = None
 		self._handle = None
 		self.has_pitch = False
+		#: True once an engine is created with a voice that actually has an
+		#: equalizer to tilt. Voices without one cannot be brightened.
+		self.has_clarity = False
+		self._dll_has_clarity = False
 		# Read buffer
 		self._buf_size = 8192
 		self._audio_buf = None
@@ -103,6 +107,14 @@ class DirectEngine:
 			except Exception:
 				pass
 		self._handle = h
+
+		# Ask the new voice whether it has an equalizer worth tilting.
+		self.has_clarity = False
+		if self._dll_has_clarity:
+			try:
+				self.has_clarity = bool(self._dll.fvwrap_hasClarity(h))
+			except Exception:
+				self.has_clarity = False
 		return True
 
 	def destroy(self) -> None:
@@ -140,6 +152,10 @@ class DirectEngine:
 	def set_pitch_percent(self, val: int) -> None:
 		if self._handle and self.has_pitch:
 			self._dll.fvwrap_setPitchPercent(self._handle, int(val))
+
+	def set_clarity_percent(self, val: int) -> None:
+		if self._handle and self.has_clarity:
+			self._dll.fvwrap_setClarityPercent(self._handle, int(val))
 
 	def begin(self) -> None:
 		if self._handle:
@@ -199,6 +215,14 @@ class DirectEngine:
 		if self.has_pitch:
 			d.fvwrap_setPitchPercent.restype = ctypes.c_int
 			d.fvwrap_setPitchPercent.argtypes = (ctypes.c_void_p, ctypes.c_int)
+		# Clarity arrived in a later wrapper build; an older fvwrap.dll simply
+		# will not export it, and the driver then hides the control.
+		self._dll_has_clarity = hasattr(d, "fvwrap_setClarityPercent")
+		if self._dll_has_clarity:
+			d.fvwrap_setClarityPercent.restype = ctypes.c_int
+			d.fvwrap_setClarityPercent.argtypes = (ctypes.c_void_p, ctypes.c_int)
+			d.fvwrap_hasClarity.restype = ctypes.c_int
+			d.fvwrap_hasClarity.argtypes = (ctypes.c_void_p,)
 		d.fvwrap_begin.restype = None
 		d.fvwrap_begin.argtypes = (ctypes.c_void_p,)
 		d.fvwrap_addTextUtf8.restype = None
