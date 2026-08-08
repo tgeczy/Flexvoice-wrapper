@@ -116,6 +116,16 @@ def _scheduleVoiceSettingsRefresh() -> None:
 				for win in _walk(top):
 					if not isinstance(win, AutoSettingsMixin):
 						continue
+					# Only OUR panel. BrailleSettingsSubPanel is an
+					# AutoSettingsMixin too, and refreshing it would make the
+					# braille display driver re-read its settings for no
+					# reason - and would create controls for a "language"
+					# setting it does not have.
+					try:
+						if getattr(win.getSettings(), "name", None) != SynthDriver.name:
+							continue
+					except Exception:
+						continue
 					try:
 						win.updateDriverSettings(changedSetting="language")
 					except Exception:
